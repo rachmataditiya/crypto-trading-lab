@@ -1,0 +1,46 @@
+# Secrets — NEVER commit these
+**/okx_config.json
+**/*_config.json
+**/*.key
+**/*.pem
+**/.env
+**/secrets/
+
+# Rust build artifacts
+engine/target/
+engine/**/*.d
+
+# Database files (sensitive trading data)
+data/
+**/*.db
+**/*.db-shm
+**/*.db-wal
+
+# Logs
+logs/
+**/*.log
+/tmp/
+
+# Cache files
+**/*_cache.json
+**/daily_balance.json
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Generated files
+**/aggressive/
+**/predictive/
+**/trading-journal/*.md

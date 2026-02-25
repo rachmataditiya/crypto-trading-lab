@@ -1,0 +1,26 @@
+[package]
+name = "sim-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Paper trading simulation engine for crypto"
+default-run = "sim-engine"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+clap = { version = "4", features = ["derive", "env"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+rand = "0.8"
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
+url = "2"
+tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+hmac        = "0.12"
+sha2        = "0.10"
+base64      = "0.22"
+anyhow      = "1"
+
+[[bin]]
+name = "live-executor"
+path = "src/bin/live_executor.rs"
