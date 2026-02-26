@@ -59,6 +59,7 @@ struct ExecutorConfig {
     max_portfolio_risk_pct: f64,
     trail_pct:              f64,
     cooldown_min:           i64,
+    cooldown_time_exit_min: i64,
     pump_filter:            PumpFilter,
     hold_min_default:       i64,
     hold_min:               HashMap<String, i64>,
@@ -621,13 +622,24 @@ fn has_open_position(conn: &Connection, symbol: &str) -> bool {
 
 /// Returns true if this symbol was closed (FILLED then closed) within the last `cooldown_min` minutes.
 /// Prevents rapid re-entry on the same coin right after a manual close or SL/TP exit.
-fn cooldown_active(conn: &Connection, symbol: &str, cooldown_min: i64) -> bool {
+fn cooldown_active(conn: &Connection, symbol: &str, cooldown_min: i64, cooldown_time_exit_min: i64) -> bool {
     let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(cooldown_min))
         .to_rfc3339();
-    conn.query_row(
+    // General cooldown: any close within cooldown_min
+    let general = conn.query_row(
         "SELECT 1 FROM open_positions
          WHERE symbol=? AND status != 'OPEN' AND closed_at >= ?",
         params![symbol, cutoff],
+        |_| Ok(true)
+    ).unwrap_or(false);
+    if general { return true; }
+    // Extended cooldown for CLOSED_TIME: same H4 setup still valid, don't re-enter for 1 H4 period
+    let time_exit_cutoff = (chrono::Utc::now() - chrono::Duration::minutes(cooldown_time_exit_min))
+        .to_rfc3339();
+    conn.query_row(
+        "SELECT 1 FROM open_positions
+         WHERE symbol=? AND status='CLOSED_TIME' AND closed_at >= ?",
+        params![symbol, time_exit_cutoff],
         |_| Ok(true)
     ).unwrap_or(false)
 }
@@ -765,7 +777,7 @@ fn main() -> Result<()> {
                     continue;
                 }
                 // Cooldown after any closed position on the same symbol
-                if cooldown_active(&live_conn, &sig.symbol, ecfg.cooldown_min) {
+                if cooldown_active(&live_conn, &sig.symbol, ecfg.cooldown_min, ecfg.cooldown_time_exit_min) {
                     println!("[executor] ⏳ Cooldown: {} closed recently, skipping", sig.symbol);
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_COOLDOWN",0.0,
                         &format!("{}min cooldown after close", ecfg.cooldown_min));
@@ -1089,6 +1101,7 @@ mod tests {
             max_portfolio_risk_pct: 6.0,
             trail_pct: 2.5,
             cooldown_min: 30,
+            cooldown_time_exit_min: 120,
             pump_filter: PumpFilter { vol_threshold: 4.0, rsi_threshold: 78.0, stretch_multiplier: 1.08 },
             hold_min_default: 60,
             hold_min,
@@ -1796,7 +1809,7 @@ mod tests {
              VALUES ('SOLUSDT','Long',1.0,80.0,77.0,83.0,86.0,2.0,'2026-01-01T00:00:00Z',?1,'CLOSED_TP2')",
             rusqlite::params![recent],
         ).unwrap();
-        assert!(cooldown_active(&conn, "SOLUSDT", 30),
+        assert!(cooldown_active(&conn, "SOLUSDT", 30, 120),
             "5-min-old close must trigger 30-min cooldown");
     }
 
@@ -1812,14 +1825,14 @@ mod tests {
              VALUES ('SOLUSDT','Long',1.0,80.0,77.0,83.0,86.0,2.0,'2026-01-01T00:00:00Z',?1,'CLOSED_TP2')",
             rusqlite::params![old],
         ).unwrap();
-        assert!(!cooldown_active(&conn, "SOLUSDT", 30),
+        assert!(!cooldown_active(&conn, "SOLUSDT", 30, 120),
             "45-min-old close is beyond 30-min cooldown — must be allowed");
     }
 
     #[test]
     fn cooldown_no_history_not_blocked() {
         let conn = make_test_db();
-        assert!(!cooldown_active(&conn, "SOLUSDT", 30),
+        assert!(!cooldown_active(&conn, "SOLUSDT", 30, 120),
             "No history → cooldown must not block");
     }
 
@@ -1835,8 +1848,56 @@ mod tests {
              VALUES ('BTCUSDT','Long',0.001,68000.0,65000.0,70000.0,72000.0,2.0,?1,'OPEN')",
             rusqlite::params![recent],
         ).unwrap();
-        assert!(!cooldown_active(&conn, "BTCUSDT", 30),
+        assert!(!cooldown_active(&conn, "BTCUSDT", 30, 120),
             "OPEN position must not trigger cooldown (only closed positions do)");
+    }
+
+    #[test]
+    fn cooldown_time_exit_blocks_for_120min() {
+        // CLOSED_TIME 60 min ago → still within 120-min extended cooldown
+        let conn = make_test_db();
+        let closed = (chrono::Utc::now() - chrono::Duration::minutes(60)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO open_positions
+             (symbol, direction, qty, entry_price, stop_price, tp1_price, tp2_price,
+              risk_usdt, opened_at, closed_at, status)
+             VALUES ('ETHUSDT','Long',1.0,2000.0,1950.0,2080.0,2160.0,3.0,'2026-01-01T00:00:00Z',?1,'CLOSED_TIME')",
+            rusqlite::params![closed],
+        ).unwrap();
+        assert!(cooldown_active(&conn, "ETHUSDT", 30, 120),
+            "CLOSED_TIME 60min ago must still block (within 120-min extended cooldown)");
+    }
+
+    #[test]
+    fn cooldown_time_exit_allows_after_120min() {
+        // CLOSED_TIME 130 min ago → beyond 120-min extended cooldown
+        let conn = make_test_db();
+        let old = (chrono::Utc::now() - chrono::Duration::minutes(130)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO open_positions
+             (symbol, direction, qty, entry_price, stop_price, tp1_price, tp2_price,
+              risk_usdt, opened_at, closed_at, status)
+             VALUES ('ETHUSDT','Long',1.0,2000.0,1950.0,2080.0,2160.0,3.0,'2026-01-01T00:00:00Z',?1,'CLOSED_TIME')",
+            rusqlite::params![old],
+        ).unwrap();
+        assert!(!cooldown_active(&conn, "ETHUSDT", 30, 120),
+            "CLOSED_TIME 130min ago is beyond 120-min extended cooldown — must allow");
+    }
+
+    #[test]
+    fn cooldown_tp2_does_not_use_extended_cooldown() {
+        // CLOSED_TP2 60 min ago → general cooldown (30min) expired, no extended cooldown
+        let conn = make_test_db();
+        let closed = (chrono::Utc::now() - chrono::Duration::minutes(60)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO open_positions
+             (symbol, direction, qty, entry_price, stop_price, tp1_price, tp2_price,
+              risk_usdt, opened_at, closed_at, status)
+             VALUES ('ETHUSDT','Long',1.0,2000.0,1950.0,2080.0,2160.0,3.0,'2026-01-01T00:00:00Z',?1,'CLOSED_TP2')",
+            rusqlite::params![closed],
+        ).unwrap();
+        assert!(!cooldown_active(&conn, "ETHUSDT", 30, 120),
+            "CLOSED_TP2 60min ago: general cooldown expired, no extended — must allow re-entry");
     }
 
     // ════════════════════════════════════════════════════════════════
