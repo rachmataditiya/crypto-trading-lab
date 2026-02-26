@@ -21,6 +21,9 @@ sha2        = "0.10"
 base64      = "0.22"
 anyhow      = "1"
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "live-executor"
 path = "src/bin/live_executor.rs"

@@ -1,9 +1,12 @@
 use crate::config::RealtimeConfig;
 use crate::sanitize;
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chrono::Utc;
+use hmac::{Hmac, Mac};
 use rand::Rng;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
@@ -11,63 +14,127 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tungstenite::{connect, stream::MaybeTlsStream, Message};
 
-const WS_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
+// Ticker/orderbook: public WS (no auth needed)
+const WS_TICKER_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
+// Candle data: business WS (authenticated for better rate limits)
+const WS_CANDLE_URL: &str = "wss://ws.okx.com:8443/ws/v5/business";
 const REST_BASE: &str = "https://www.okx.com";
+
+// Deque capacity per timeframe
+const MAX_1M: usize = 120; // 2h of 1m closes
+const MAX_1H: usize = 120; // 5d of H1 closes
+const MAX_4H: usize = 120; // 20d of H4 closes
+const MAX_1D: usize = 100; // 100d of D1 closes
+
+// ── Credentials ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct OkxConfig {
+    api_key:    String,
+    secret_key: String,
+    passphrase: String,
+}
+
+fn load_creds(workspace: &Path) -> Result<OkxConfig, String> {
+    let path = workspace.join("data/trading-journal/okx_config.json");
+    let raw  = fs::read_to_string(&path)
+        .map_err(|e| format!("read okx_config: {e}"))?;
+    serde_json::from_str(&raw)
+        .map_err(|e| format!("parse okx_config: {e}"))
+}
+
+fn ws_login_msg(creds: &OkxConfig) -> String {
+    let ts  = format!("{}", Utc::now().timestamp());
+    let msg = format!("{}GET/users/self/verify", ts);
+    let mut mac = Hmac::<Sha256>::new_from_slice(creds.secret_key.as_bytes())
+        .expect("hmac key");
+    mac.update(msg.as_bytes());
+    let sig = B64.encode(mac.finalize().into_bytes());
+    serde_json::json!({
+        "op": "login",
+        "args": [{
+            "apiKey":     creds.api_key,
+            "passphrase": creds.passphrase,
+            "timestamp":  ts,
+            "sign":       sig
+        }]
+    })
+    .to_string()
+}
+
+// ── State ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SymbolState {
-    pub symbol: String,
-    pub price: f64,
-    pub ret_24h: f64,
-    pub ret_3d: f64,
-    pub ret_7d: f64,
-    pub ema20: f64,
-    pub ema50: f64,
-    pub rsi14: f64,
-    pub atr14_pct: f64,
-    pub adx14: f64,
+    pub symbol:      String,
+    pub price:       f64,
+    pub ret_24h:     f64,
+    pub ret_3d:      f64,
+    pub ret_7d:      f64,
+    pub ema20:       f64,
+    pub ema50:       f64,
+    pub rsi14:       f64,
+    pub atr14_pct:   f64,
+    pub adx14:       f64,
     pub volume_ratio: f64,
-    pub bid: f64,
-    pub ask: f64,
-    pub spread_bps: f64,
-    pub updated_at: String,
+    pub bid:         f64,
+    pub ask:         f64,
+    pub spread_bps:  f64,
+    pub updated_at:  String,
+    /// Indicates which timeframe is driving the indicators
+    pub indicator_tf: String,
+
+    // ── close-price history (not serialised, rebuilt from WS / REST seed) ──
     #[serde(skip)]
-    closes: VecDeque<f64>,
+    closes:     VecDeque<f64>, // 1m confirmed closes
+    #[serde(skip)]
+    closes_1h:  VecDeque<f64>, // H1 confirmed closes
+    #[serde(skip)]
+    closes_4h:  VecDeque<f64>, // H4 confirmed closes
+    #[serde(skip)]
+    closes_1d:  VecDeque<f64>, // D1 confirmed closes
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RealtimeHealth {
-    pub provider: String,
-    pub ws_connected: bool,
-    pub fallback_active: bool,
-    pub reconnect_count: u64,
-    pub last_update_at: String,
+    pub provider:            String,
+    pub ws_connected:        bool,
+    pub fallback_active:     bool,
+    pub reconnect_count:     u64,
+    pub last_update_at:      String,
     pub last_update_age_secs: u64,
-    pub stale_feed: bool,
-    pub rest_429_count: u64,
+    pub stale_feed:          bool,
+    pub rest_429_count:      u64,
     pub network_error_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RealtimeCache {
     pub generated_at: String,
-    pub symbols: HashMap<String, SymbolState>,
-    pub health: RealtimeHealth,
+    pub symbols:      HashMap<String, SymbolState>,
+    pub health:       RealtimeHealth,
 }
 
+// ── Entry point ─────────────────────────────────────────────────────────────
+
 pub fn run_daemon(workspace: &Path, cfg: &RealtimeConfig) -> Result<(), String> {
+    let creds = load_creds(workspace)?;
+    eprintln!("[REALTIME] OKX credentials loaded (key: {}...)", &creds.api_key[..8]);
+
     let mut cache = RealtimeCache::default();
     cache.health.provider = cfg.provider.clone();
     let mut backoff_secs = 1u64;
 
-    // ── Initial REST poll to pre-populate EMA / historical data ──────────────
-    eprintln!("[REALTIME] initial REST poll to seed EMA data...");
+    // Seed historical candle data via REST before WS connects
+    eprintln!("[REALTIME] seeding H1/H4/D1 candle history via REST...");
     let _ = rest_poll_once(workspace, cfg, &mut cache);
-    eprintln!("[REALTIME] REST seed done. Symbols with price: {}",
-        cache.symbols.values().filter(|s| s.price > 0.0).count());
+    eprintln!(
+        "[REALTIME] REST seed done — symbols with price: {}",
+        cache.symbols.values().filter(|s| s.price > 0.0).count()
+    );
 
     loop {
-        match run_ws_session(workspace, cfg, &mut cache) {
+        match run_ws_dual_session(workspace, cfg, &mut cache, &creds) {
             Ok(()) => {
                 backoff_secs = 1;
             }
@@ -76,9 +143,13 @@ pub fn run_daemon(workspace: &Path, cfg: &RealtimeConfig) -> Result<(), String> 
                 cache.health.ws_connected = false;
                 cache.health.fallback_active = true;
                 cache.health.reconnect_count += 1;
+                // Fallback to REST while waiting to reconnect
                 let _ = rest_poll_once(workspace, cfg, &mut cache);
                 let jitter = rand::thread_rng().gen_range(0..=700u64);
-                eprintln!("[REALTIME] reconnect in {}s (attempt #{})", backoff_secs, cache.health.reconnect_count);
+                eprintln!(
+                    "[REALTIME] reconnect in {}s (attempt #{})",
+                    backoff_secs, cache.health.reconnect_count
+                );
                 thread::sleep(Duration::from_millis(backoff_secs * 1000 + jitter));
                 backoff_secs = (backoff_secs * 2).min(60);
             }
@@ -86,58 +157,167 @@ pub fn run_daemon(workspace: &Path, cfg: &RealtimeConfig) -> Result<(), String> 
     }
 }
 
-fn run_ws_session(
-    workspace: &Path,
-    cfg: &RealtimeConfig,
-    cache: &mut RealtimeCache,
-) -> Result<(), String> {
-    let (mut socket, _resp) = connect(WS_URL).map_err(|e| format!("ws connect: {e}"))?;
-    set_nonblocking(socket.get_mut()).map_err(|e| format!("set nonblocking: {e}"))?;
-    cache.health.ws_connected = true;
-    cache.health.fallback_active = false;
+// ── Dual WebSocket session ──────────────────────────────────────────────────
 
-    let args: Vec<serde_json::Value> = cfg
+fn run_ws_dual_session(
+    workspace: &Path,
+    cfg:       &RealtimeConfig,
+    cache:     &mut RealtimeCache,
+    creds:     &OkxConfig,
+) -> Result<(), String> {
+    // ── Connection 1: public — tickers + books5 ───────────────────────────
+    eprintln!("[REALTIME] connecting ticker WS (public)...");
+    let (mut ticker_sock, _) =
+        connect(WS_TICKER_URL).map_err(|e| format!("ticker ws connect: {e}"))?;
+    set_nonblocking(ticker_sock.get_mut()).map_err(|e| format!("ticker nonblocking: {e}"))?;
+
+    let ticker_args: Vec<serde_json::Value> = cfg
         .symbols
         .iter()
         .flat_map(|s| {
             let inst = to_okx_inst(s);
             vec![
                 serde_json::json!({"channel":"tickers","instId":inst}),
-                serde_json::json!({"channel":"candle1m","instId":inst}),
                 serde_json::json!({"channel":"books5","instId":inst}),
             ]
         })
         .collect();
-    let sub = serde_json::json!({"op":"subscribe","args":args}).to_string();
-    socket
+    let sub = serde_json::json!({"op":"subscribe","args":ticker_args}).to_string();
+    ticker_sock
         .send(Message::Text(sub))
-        .map_err(|e| format!("ws subscribe: {e}"))?;
+        .map_err(|e| format!("ticker subscribe: {e}"))?;
+    eprintln!(
+        "[REALTIME] ticker WS subscribed ({} channels)",
+        cfg.symbols.len() * 2
+    );
 
-    let mut last_msg = Instant::now();
-    let mut last_ping = Instant::now();
+    // ── Connection 2: business — candles 1m/1H/4H/1D (authenticated) ─────
+    eprintln!("[REALTIME] connecting candle WS (business, authenticated)...");
+    let (mut candle_sock, _) =
+        connect(WS_CANDLE_URL).map_err(|e| format!("candle ws connect: {e}"))?;
+    set_nonblocking(candle_sock.get_mut()).map_err(|e| format!("candle nonblocking: {e}"))?;
 
-    loop {
-        match socket.read() {
-            Ok(msg) => {
-                if let Message::Text(txt) = msg {
-                    apply_ws_message(&txt, cache);
-                    cache.generated_at = Utc::now().to_rfc3339();
-                    cache.health.last_update_at = cache.generated_at.clone();
-                    cache.health.last_update_age_secs = 0;
-                    cache.health.stale_feed = false;
-                    persist_cache(workspace, cache)?;
-                    last_msg = Instant::now();
+    // Send login — temporarily block to get response (max 2s)
+    let login = ws_login_msg(creds);
+    candle_sock
+        .send(Message::Text(login))
+        .map_err(|e| format!("candle login send: {e}"))?;
+
+    // Wait for login ack (briefly block; it's early startup so blocking is OK)
+    let login_deadline = Instant::now() + Duration::from_secs(3);
+    let mut logged_in = false;
+    while Instant::now() < login_deadline {
+        match candle_sock.read() {
+            Ok(Message::Text(txt)) => {
+                if txt.contains("\"login\"") {
+                    logged_in = true;
+                    eprintln!("[REALTIME] candle WS login OK");
+                    break;
                 }
             }
-            Err(tungstenite::Error::Io(ref ioe))
-                if ioe.kind() == std::io::ErrorKind::WouldBlock
-                    || ioe.kind() == std::io::ErrorKind::TimedOut =>
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(ref e))
+                if e.kind() == std::io::ErrorKind::WouldBlock =>
             {
-                // pass
+                thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("ws read: {e}")),
+            Err(e) => {
+                eprintln!("[REALTIME] candle login wait error: {e} (continuing without auth)");
+                break;
+            }
+        }
+    }
+    if !logged_in {
+        eprintln!("[REALTIME] candle WS login timeout — proceeding (public channels still work)");
+    }
+
+    // Subscribe all candle channels in one message (rate: 3 msgs/sec, but 1 msg = fine)
+    let candle_args: Vec<serde_json::Value> = cfg
+        .symbols
+        .iter()
+        .flat_map(|s| {
+            let inst = to_okx_inst(s);
+            vec![
+                serde_json::json!({"channel":"candle1m","instId":inst}),
+                serde_json::json!({"channel":"candle1H","instId":inst}),
+                serde_json::json!({"channel":"candle4H","instId":inst}),
+                serde_json::json!({"channel":"candle1D","instId":inst}),
+            ]
+        })
+        .collect();
+
+    // OKX rate limit: 3 subscribe *messages* per second.
+    // We batch into groups of 30 args per message (arbitrary grouping), one message per 400ms.
+    for chunk in candle_args.chunks(30) {
+        let msg = serde_json::json!({"op":"subscribe","args":chunk}).to_string();
+        candle_sock
+            .send(Message::Text(msg))
+            .map_err(|e| format!("candle subscribe: {e}"))?;
+        thread::sleep(Duration::from_millis(400));
+    }
+    eprintln!(
+        "[REALTIME] candle WS subscribed ({} channels: 1m+1H+4H+1D × {} symbols)",
+        cfg.symbols.len() * 4,
+        cfg.symbols.len()
+    );
+
+    cache.health.ws_connected = true;
+    cache.health.fallback_active = false;
+
+    // ── Dual-socket poll loop ─────────────────────────────────────────────
+    let mut last_msg     = Instant::now();
+    let mut last_ping    = Instant::now();
+    let mut last_persist = Instant::now();
+
+    loop {
+        let mut changed = false;
+
+        // Poll ticker socket
+        match ticker_sock.read() {
+            Ok(Message::Text(txt)) => {
+                apply_ws_message(&txt, cache);
+                changed = true;
+                last_msg = Instant::now();
+            }
+            Ok(Message::Ping(d)) => {
+                let _ = ticker_sock.send(Message::Pong(d));
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(ref e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("ticker ws read: {e}")),
         }
 
+        // Poll candle socket
+        match candle_sock.read() {
+            Ok(Message::Text(txt)) => {
+                apply_ws_message(&txt, cache);
+                changed = true;
+                last_msg = Instant::now();
+            }
+            Ok(Message::Ping(d)) => {
+                let _ = candle_sock.send(Message::Pong(d));
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(ref e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("candle ws read: {e}")),
+        }
+
+        // Persist at most once per second (avoid hammering disk)
+        if changed && last_persist.elapsed() >= Duration::from_secs(1) {
+            let now = Utc::now().to_rfc3339();
+            cache.generated_at = now.clone();
+            cache.health.last_update_at = now;
+            cache.health.last_update_age_secs = 0;
+            cache.health.stale_feed = false;
+            persist_cache(workspace, cache)?;
+            last_persist = Instant::now();
+        }
+
+        // Stale feed detection
         let age = last_msg.elapsed().as_secs();
         cache.health.last_update_age_secs = age;
         if age > cfg.stale_after_secs {
@@ -145,226 +325,173 @@ fn run_ws_session(
             return Err(format!("stale feed ({}s)", age));
         }
 
+        // Periodic ping to keep both connections alive
         if last_ping.elapsed().as_secs() >= cfg.ws_ping_interval_secs {
-            let _ = socket.send(Message::Ping(vec![]));
+            let _ = ticker_sock.send(Message::Ping(vec![]));
+            let _ = candle_sock.send(Message::Ping(vec![]));
             last_ping = Instant::now();
+        }
+
+        if !changed {
+            thread::sleep(Duration::from_millis(10));
         }
     }
 }
+
+// ── Message handler ─────────────────────────────────────────────────────────
 
 fn apply_ws_message(txt: &str, cache: &mut RealtimeCache) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(txt) else {
         return;
     };
-    let Some(arg) = v.get("arg") else {
-        return;
-    };
-    let Some(ch) = arg.get("channel").and_then(|x| x.as_str()) else {
-        return;
-    };
-    let Some(inst) = arg.get("instId").and_then(|x| x.as_str()) else {
-        return;
-    };
+    let Some(arg) = v.get("arg") else { return };
+    let Some(ch)  = arg.get("channel").and_then(|x| x.as_str()) else { return };
+    let Some(inst) = arg.get("instId").and_then(|x| x.as_str()) else { return };
     let symbol = from_okx_inst(inst);
-    let state = cache
-        .symbols
-        .entry(symbol.clone())
-        .or_insert_with(|| SymbolState {
-            symbol: symbol.clone(),
-            ..Default::default()
-        });
 
-    if let Some(arr) = v.get("data").and_then(|x| x.as_array()) {
-        match ch {
-            "tickers" => {
-                if let Some(d) = arr.first() {
-                    state.price = parse_num(d.get("last"));
-                    let sod = parse_num(d.get("sodUtc0"));
-                    if sod > 0.0 {
-                        state.ret_24h = sanitize::ret_pct(((state.price / sod) - 1.0) * 100.0);
-                    }
-                    let vol_base = parse_num(d.get("vol24h"));
-                    let vol_quote = parse_num(d.get("volCcy24h"));
-                    // Per-coin baseline: OKX 24h USDT volume for a "normal" day
-                    // (OKX ~15-20% of Binance market share for spot)
-                    // ratio=1.0 = typical day, >1.0 = high activity
-                    let baseline = match state.symbol.as_str() {
-                        "BTCUSDT"  => 200_000_000.0,  // ~200M USDT/day on OKX
-                        "ETHUSDT"  => 100_000_000.0,  // ~100M USDT/day on OKX
-                        "SOLUSDT"  => 20_000_000.0,   // ~20M USDT/day on OKX
-                        "BNBUSDT"  => 10_000_000.0,   // ~10M USDT/day on OKX
-                        "ATOMUSDT" => 3_000_000.0,    // ~3M USDT/day on OKX
-                        _          => 20_000_000.0,
-                    };
-                    let raw_ratio = if vol_quote > 0.0 {
-                        vol_quote / baseline
-                    } else if vol_base > 0.0 {
-                        (vol_base * state.price) / baseline
-                    } else {
-                        1.0
-                    };
-                    state.volume_ratio = sanitize::volume_ratio(raw_ratio);
-                }
-            }
-            "candle1m" => {
-                if let Some(row) = arr.first().and_then(|x| x.as_array()) {
-                    if let Some(close) = row
-                        .get(4)
-                        .and_then(|x| x.as_str())
-                        .and_then(|x| x.parse::<f64>().ok())
-                    {
-                        state.closes.push_back(close);
-                        while state.closes.len() > 60 {
-                            state.closes.pop_front();
-                        }
-                        compute_features(state);
-                    }
-                }
-            }
-            "books5" => {
-                if let Some(d) = arr.first() {
-                    state.bid = d
-                        .get("bids")
-                        .and_then(|b| b.as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|r| r.as_array())
-                        .and_then(|r| r.first())
-                        .and_then(|x| x.as_str())
-                        .and_then(|x| x.parse::<f64>().ok())
-                        .unwrap_or(0.0);
-                    state.ask = d
-                        .get("asks")
-                        .and_then(|b| b.as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|r| r.as_array())
-                        .and_then(|r| r.first())
-                        .and_then(|x| x.as_str())
-                        .and_then(|x| x.parse::<f64>().ok())
-                        .unwrap_or(0.0);
-                    if state.bid > 0.0 && state.ask > 0.0 {
-                        state.spread_bps =
-                            ((state.ask - state.bid) / ((state.ask + state.bid) / 2.0)) * 10_000.0;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    state.updated_at = Utc::now().to_rfc3339();
-}
+    let state = cache.symbols.entry(symbol.clone()).or_insert_with(|| SymbolState {
+        symbol: symbol.clone(),
+        ..Default::default()
+    });
 
-pub fn rest_poll_once(
-    workspace: &Path,
-    cfg: &RealtimeConfig,
-    cache: &mut RealtimeCache,
-) -> Result<(), String> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("rest client: {e}"))?;
-    let symbols = cfg.symbols.clone();
-    for batch in symbols.chunks(cfg.rest_batch_size.max(1)) {
-        for symbol in batch {
-            if let Err(e) = fetch_symbol_rest(&client, symbol, cache) {
-                if e.contains("429") {
-                    cache.health.rest_429_count += 1;
+    let Some(arr) = v.get("data").and_then(|x| x.as_array()) else { return };
+
+    match ch {
+        // ── Ticker: price + volume ──────────────────────────────────────
+        "tickers" => {
+            if let Some(d) = arr.first() {
+                state.price = parse_num(d.get("last"));
+                let sod = parse_num(d.get("sodUtc0"));
+                if sod > 0.0 {
+                    state.ret_24h =
+                        sanitize::ret_pct(((state.price / sod) - 1.0) * 100.0);
+                }
+                let vol_quote = parse_num(d.get("volCcy24h"));
+                let vol_base  = parse_num(d.get("vol24h"));
+                let baseline  = volume_baseline(&state.symbol);
+                let raw_ratio = if vol_quote > 0.0 {
+                    vol_quote / baseline
+                } else if vol_base > 0.0 && state.price > 0.0 {
+                    (vol_base * state.price) / baseline
                 } else {
-                    cache.health.network_error_count += 1;
-                }
-                eprintln!("[REALTIME] REST degraded {symbol}: {e}");
+                    1.0
+                };
+                state.volume_ratio = sanitize::volume_ratio(raw_ratio);
             }
         }
-        thread::sleep(Duration::from_millis(cfg.rest_throttle_ms));
-    }
-    cache.generated_at = Utc::now().to_rfc3339();
-    cache.health.last_update_at = cache.generated_at.clone();
-    cache.health.last_update_age_secs = 0;
-    cache.health.stale_feed = false;
-    cache.health.fallback_active = true;
-    persist_cache(workspace, cache)
-}
 
-fn fetch_symbol_rest(
-    client: &Client,
-    symbol: &str,
-    cache: &mut RealtimeCache,
-) -> Result<(), String> {
-    let inst = to_okx_inst(symbol);
-    let ticker_url = format!("{REST_BASE}/api/v5/market/ticker?instId={inst}");
-    let t_resp = client
-        .get(&ticker_url)
-        .send()
-        .map_err(|e| format!("ticker send: {e}"))?;
-    if t_resp.status().as_u16() == 429 {
-        return Err("429 ticker".to_string());
-    }
-    let t_json: serde_json::Value = t_resp.json().map_err(|e| format!("ticker json: {e}"))?;
-    let t = t_json
-        .get("data")
-        .and_then(|x| x.as_array())
-        .and_then(|a| a.first())
-        .ok_or("ticker data missing")?;
-
-    let candle_url = format!("{REST_BASE}/api/v5/market/candles?instId={inst}&bar=1m&limit=60");
-    let c_resp = client
-        .get(&candle_url)
-        .send()
-        .map_err(|e| format!("candles send: {e}"))?;
-    if c_resp.status().as_u16() == 429 {
-        return Err("429 candles".to_string());
-    }
-    let c_json: serde_json::Value = c_resp.json().map_err(|e| format!("candles json: {e}"))?;
-
-    let state = cache
-        .symbols
-        .entry(symbol.to_string())
-        .or_insert_with(|| SymbolState {
-            symbol: symbol.to_string(),
-            ..Default::default()
-        });
-    state.price = parse_num(t.get("last"));
-    let sod = parse_num(t.get("sodUtc0"));
-    if sod > 0.0 {
-        state.ret_24h = sanitize::ret_pct(((state.price / sod) - 1.0) * 100.0);
-    }
-
-    state.closes.clear();
-    if let Some(rows) = c_json.get("data").and_then(|x| x.as_array()) {
-        let mut closes = rows
-            .iter()
-            .filter_map(|r| r.as_array())
-            .filter_map(|r| r.get(4))
-            .filter_map(|x| x.as_str())
-            .filter_map(|x| x.parse::<f64>().ok())
-            .collect::<Vec<f64>>();
-        // OKX returns candles newest-first → reverse to get chronological order
-        closes.reverse();
-        for c in closes.into_iter().take(60) {
-            state.closes.push_back(c);
+        // ── Orderbook: bid/ask/spread ────────────────────────────────────
+        "books5" => {
+            if let Some(d) = arr.first() {
+                state.bid = book_top(d.get("bids"));
+                state.ask = book_top(d.get("asks"));
+                if state.bid > 0.0 && state.ask > 0.0 {
+                    let mid = (state.ask + state.bid) / 2.0;
+                    state.spread_bps = ((state.ask - state.bid) / mid) * 10_000.0;
+                }
+            }
         }
+
+        // ── Candles: only accepted when confirmed (confirm field == "1") ─
+        // OKX candle format: [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
+        //                      0    1     2    3    4     5    6       7            8
+        "candle1m" => {
+            if let Some(close) = confirmed_close(arr) {
+                push_close(&mut state.closes, close, MAX_1M);
+                recompute_indicators(state);
+            }
+        }
+        "candle1H" => {
+            if let Some(close) = confirmed_close(arr) {
+                push_close(&mut state.closes_1h, close, MAX_1H);
+                recompute_indicators(state);
+            }
+        }
+        "candle4H" => {
+            if let Some(close) = confirmed_close(arr) {
+                push_close(&mut state.closes_4h, close, MAX_4H);
+                recompute_indicators(state);
+            }
+        }
+        "candle1D" => {
+            if let Some(close) = confirmed_close(arr) {
+                push_close(&mut state.closes_1d, close, MAX_1D);
+                recompute_indicators(state);
+            }
+        }
+        _ => {}
     }
-    compute_features(state);
+
     state.updated_at = Utc::now().to_rfc3339();
-    Ok(())
 }
 
-fn compute_features(state: &mut SymbolState) {
-    if state.closes.is_empty() {
-        return;
+/// Extract close from a candle push, only when confirm=="1" (candle closed).
+fn confirmed_close(arr: &[serde_json::Value]) -> Option<f64> {
+    let row = arr.first()?.as_array()?;
+    // confirm field is at index 8; "1" = confirmed close
+    let confirmed = row
+        .get(8)
+        .and_then(|x| x.as_str())
+        .map(|s| s == "1")
+        .unwrap_or(false);
+    if !confirmed {
+        return None;
     }
-    let v: Vec<f64> = state.closes.iter().copied().collect();
-    state.ema20 = sma_tail(&v, 20).unwrap_or(state.price);
-    state.ema50 = sma_tail(&v, 50).unwrap_or(state.price);
+    row.get(4)
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+}
 
-    // Real RSI14 from close-to-close changes
-    state.rsi14 = compute_rsi14(&v);
+fn push_close(deque: &mut VecDeque<f64>, close: f64, max: usize) {
+    deque.push_back(close);
+    while deque.len() > max {
+        deque.pop_front();
+    }
+}
 
-    // ATR14 approximation: abs(close[i] - close[i-1]), mean of last 14
-    state.atr14_pct = compute_atr14_pct(&v, state.price);
+// ── Indicator computation ────────────────────────────────────────────────────
 
-    // ADX: rough approximation via directional movement (close-based)
-    state.adx14 = sanitize::adx(compute_adx14_approx(&v));
+/// Recompute all indicators from best available timeframe.
+/// Priority: H4 (aligns with crypto-scan) → H1 → 1m fallback
+fn recompute_indicators(state: &mut SymbolState) {
+    let (closes, tf, atr_scale) = if state.closes_4h.len() >= 20 {
+        (
+            state.closes_4h.iter().copied().collect::<Vec<_>>(),
+            "4H",
+            6.0_f64.sqrt(), // ATR4H → daily: sqrt(24/4) = sqrt(6) ≈ 2.45
+        )
+    } else if state.closes_1h.len() >= 15 {
+        (
+            state.closes_1h.iter().copied().collect::<Vec<_>>(),
+            "1H",
+            24.0_f64.sqrt(), // ATR1H → daily: sqrt(24) ≈ 4.90
+        )
+    } else if state.closes.len() >= 15 {
+        (
+            state.closes.iter().copied().collect::<Vec<_>>(),
+            "1m",
+            1440.0_f64.sqrt(), // ATR1m → daily: sqrt(1440) ≈ 37.95
+        )
+    } else {
+        return; // Not enough data yet
+    };
 
+    state.indicator_tf = tf.to_string();
+
+    // EMA20 and EMA50
+    state.ema20 = ema_tail(&closes, 20).unwrap_or(state.price);
+    state.ema50 = ema_tail(&closes, 50).unwrap_or(state.price);
+
+    // RSI14
+    state.rsi14 = compute_rsi14(&closes);
+
+    // ATR14 scaled to daily equivalent
+    state.atr14_pct = compute_atr14_pct(&closes, state.price, atr_scale);
+
+    // ADX14
+    state.adx14 = sanitize::adx(compute_adx14_approx(&closes));
+
+    // Multi-day returns (rough approximation from 24h ret)
     state.ret_3d = sanitize::ret_pct(state.ret_24h * 1.8);
     state.ret_7d = sanitize::ret_pct(state.ret_24h * 3.0);
 }
@@ -375,16 +502,15 @@ fn compute_rsi14(v: &[f64]) -> f64 {
     }
     let changes: Vec<f64> = v.windows(2).map(|w| w[1] - w[0]).collect();
     let last14 = &changes[changes.len().saturating_sub(14)..];
-    let avg_gain: f64 = last14.iter().map(|&c| if c > 0.0 { c } else { 0.0 }).sum::<f64>() / 14.0;
-    let avg_loss: f64 = last14.iter().map(|&c| if c < 0.0 { -c } else { 0.0 }).sum::<f64>() / 14.0;
+    let avg_gain = last14.iter().map(|&c| if c > 0.0 { c } else { 0.0 }).sum::<f64>() / 14.0;
+    let avg_loss = last14.iter().map(|&c| if c < 0.0 { -c } else { 0.0 }).sum::<f64>() / 14.0;
     if avg_loss == 0.0 {
         return 100.0;
     }
-    let rs = avg_gain / avg_loss;
-    (100.0 - 100.0 / (1.0 + rs)).clamp(0.0, 100.0)
+    (100.0 - 100.0 / (1.0 + avg_gain / avg_loss)).clamp(0.0, 100.0)
 }
 
-fn compute_atr14_pct(v: &[f64], price: f64) -> f64 {
+fn compute_atr14_pct(v: &[f64], price: f64, daily_scale: f64) -> f64 {
     if v.len() < 2 || price <= 0.0 {
         return 1.0;
     }
@@ -393,40 +519,167 @@ fn compute_atr14_pct(v: &[f64], price: f64) -> f64 {
     if last14.is_empty() {
         return 1.0;
     }
-    let atr_1m: f64 = last14.iter().sum::<f64>() / last14.len() as f64;
-    let atr_1m_pct = (atr_1m / price) * 100.0;
-    // Scale 1m ATR to daily equivalent: multiply by sqrt(1440 min/day)
-    let daily_atr_pct = atr_1m_pct * 37.95;
-    daily_atr_pct.clamp(0.0, 50.0)
+    let atr  = last14.iter().sum::<f64>() / last14.len() as f64;
+    let atr_pct = (atr / price) * 100.0;
+    (atr_pct * daily_scale).clamp(0.0, 50.0)
 }
 
 fn compute_adx14_approx(v: &[f64]) -> f64 {
-    // Approximate ADX using close-based directional movement
-    // Without H/L data, we use close differences as proxy for DM
-    if v.len() < 15 {
+    const PERIOD: usize = 14;
+    if v.len() < PERIOD + 2 {
         return 20.0;
     }
     let changes: Vec<f64> = v.windows(2).map(|w| w[1] - w[0]).collect();
-    let last14 = &changes[changes.len().saturating_sub(14)..];
-    let pos_sum: f64 = last14.iter().filter(|&&c| c > 0.0).map(|&c| c).sum();
-    let neg_sum: f64 = last14.iter().filter(|&&c| c < 0.0).map(|&c| c.abs()).sum();
-    let total = pos_sum + neg_sum;
-    if total == 0.0 {
-        return 15.0;
+    let mut dx_series: Vec<f64> = Vec::new();
+    for i in PERIOD..=changes.len() {
+        let window   = &changes[i - PERIOD..i];
+        let pos_sum: f64 = window.iter().filter(|&&c| c > 0.0).sum();
+        let neg_sum: f64 = window.iter().filter(|&&c| c < 0.0).map(|c| c.abs()).sum();
+        let total = pos_sum + neg_sum;
+        if total > 0.0 {
+            dx_series.push(((pos_sum - neg_sum).abs() / total) * 100.0);
+        }
     }
-    // DX = |DI+ - DI-| / (DI+ + DI-) * 100
-    // ADX ≈ smoothed DX (no artificial floor — let the filter do its job)
-    let dx = ((pos_sum - neg_sum).abs() / total) * 100.0;
-    (dx * 0.7).clamp(10.0, 50.0)
+    if dx_series.is_empty() {
+        return 20.0;
+    }
+    let alpha = 1.0 / PERIOD as f64;
+    let mut adx = dx_series[0];
+    for &dx in dx_series.iter().skip(1) {
+        adx = adx * (1.0 - alpha) + dx * alpha;
+    }
+    adx.clamp(10.0, 80.0)
 }
 
-fn sma_tail(v: &[f64], n: usize) -> Option<f64> {
+/// Exponential moving average of the last `n` values.
+fn ema_tail(v: &[f64], n: usize) -> Option<f64> {
     if v.len() < n {
         return None;
     }
-    let s: f64 = v[v.len() - n..].iter().sum();
-    Some(s / n as f64)
+    // Seed with SMA of first n values in the window, then apply EMA
+    let window = &v[v.len().saturating_sub(n * 3)..]; // use up to 3× n for warm-up
+    if window.len() < n {
+        return None;
+    }
+    let alpha = 2.0 / (n as f64 + 1.0);
+    let seed: f64 = window[..n].iter().sum::<f64>() / n as f64;
+    let mut ema = seed;
+    for &c in window[n..].iter() {
+        ema = c * alpha + ema * (1.0 - alpha);
+    }
+    Some(ema)
 }
+
+// ── REST fallback / seed ─────────────────────────────────────────────────────
+
+pub fn rest_poll_once(
+    workspace: &Path,
+    cfg:       &RealtimeConfig,
+    cache:     &mut RealtimeCache,
+) -> Result<(), String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent("okx-rs-client/1.0")
+        .build()
+        .map_err(|e| format!("rest client: {e}"))?;
+
+    for symbol in &cfg.symbols {
+        if let Err(e) = fetch_symbol_rest(&client, symbol, cache) {
+            if e.contains("429") {
+                cache.health.rest_429_count += 1;
+            } else {
+                cache.health.network_error_count += 1;
+            }
+            eprintln!("[REALTIME] REST degraded {symbol}: {e}");
+        }
+        thread::sleep(Duration::from_millis(cfg.rest_throttle_ms));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    cache.generated_at               = now.clone();
+    cache.health.last_update_at      = now;
+    cache.health.last_update_age_secs = 0;
+    cache.health.stale_feed          = false;
+    cache.health.fallback_active     = true;
+    persist_cache(workspace, cache)
+}
+
+fn fetch_symbol_rest(
+    client: &Client,
+    symbol: &str,
+    cache:  &mut RealtimeCache,
+) -> Result<(), String> {
+    let inst = to_okx_inst(symbol);
+
+    // ── Ticker ─────────────────────────────────────────────────────────────
+    let t_resp = client
+        .get(format!("{REST_BASE}/api/v5/market/ticker?instId={inst}"))
+        .send()
+        .map_err(|e| format!("ticker send: {e}"))?;
+    if t_resp.status().as_u16() == 429 { return Err("429 ticker".into()); }
+    let t_json: serde_json::Value = t_resp.json().map_err(|e| format!("ticker json: {e}"))?;
+    let t = t_json.get("data").and_then(|x| x.as_array())
+        .and_then(|a| a.first()).ok_or("ticker data missing")?;
+
+    let state = cache.symbols.entry(symbol.to_string()).or_insert_with(|| SymbolState {
+        symbol: symbol.to_string(),
+        ..Default::default()
+    });
+    state.price   = parse_num(t.get("last"));
+    let sod = parse_num(t.get("sodUtc0"));
+    if sod > 0.0 {
+        state.ret_24h = sanitize::ret_pct(((state.price / sod) - 1.0) * 100.0);
+    }
+
+    // ── Seed 1m closes (100 candles) ───────────────────────────────────────
+    fetch_candles_into(client, &inst, "1m",  100, &mut state.closes)?;
+
+    // ── Seed H1 closes (120 candles ≈ 5 days) ──────────────────────────────
+    fetch_candles_into(client, &inst, "1H",  120, &mut state.closes_1h)?;
+
+    // ── Seed H4 closes (120 candles ≈ 20 days) ─────────────────────────────
+    fetch_candles_into(client, &inst, "4H",  120, &mut state.closes_4h)?;
+
+    // ── Seed D1 closes (100 candles ≈ 3 months) ────────────────────────────
+    fetch_candles_into(client, &inst, "1D",  100, &mut state.closes_1d)?;
+
+    recompute_indicators(state);
+    state.updated_at = Utc::now().to_rfc3339();
+    Ok(())
+}
+
+/// Fetch historical candles and populate a VecDeque (chronological order).
+fn fetch_candles_into(
+    client: &Client,
+    inst:   &str,
+    bar:    &str,
+    limit:  usize,
+    deque:  &mut VecDeque<f64>,
+) -> Result<(), String> {
+    let url = format!("{REST_BASE}/api/v5/market/candles?instId={inst}&bar={bar}&limit={limit}");
+    let resp = client.get(&url).send().map_err(|e| format!("candles({bar}) send: {e}"))?;
+    if resp.status().as_u16() == 429 { return Err(format!("429 candles {bar}")); }
+    let json: serde_json::Value = resp.json().map_err(|e| format!("candles({bar}) json: {e}"))?;
+
+    if let Some(rows) = json.get("data").and_then(|x| x.as_array()) {
+        let mut closes: Vec<f64> = rows
+            .iter()
+            .filter_map(|r| r.as_array())
+            .filter_map(|r| r.get(4))
+            .filter_map(|x| x.as_str())
+            .filter_map(|x| x.parse::<f64>().ok())
+            .collect();
+        // OKX returns newest-first → reverse for chronological order
+        closes.reverse();
+        deque.clear();
+        for c in closes {
+            deque.push_back(c);
+        }
+    }
+    Ok(())
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn persist_cache(workspace: &Path, cache: &RealtimeCache) -> Result<(), String> {
     let path = workspace.join("data/trading-journal/realtime_cache.json");
@@ -446,10 +699,36 @@ fn parse_num(v: Option<&serde_json::Value>) -> f64 {
     }
 }
 
+fn book_top(v: Option<&serde_json::Value>) -> f64 {
+    v.and_then(|b| b.as_array())
+        .and_then(|a| a.first())
+        .and_then(|r| r.as_array())
+        .and_then(|r| r.first())
+        .and_then(|x| x.as_str())
+        .and_then(|x| x.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+fn volume_baseline(symbol: &str) -> f64 {
+    match symbol {
+        "BTCUSDT"  => 200_000_000.0,
+        "ETHUSDT"  => 100_000_000.0,
+        "SOLUSDT"  => 20_000_000.0,
+        "BNBUSDT"  => 10_000_000.0,
+        "XRPUSDT"  => 15_000_000.0,
+        "ADAUSDT"  => 8_000_000.0,
+        "DOGEUSDT" => 10_000_000.0,
+        "AVAXUSDT" => 8_000_000.0,
+        "LINKUSDT" => 5_000_000.0,
+        "DOTUSDT"  => 5_000_000.0,
+        _          => 5_000_000.0,
+    }
+}
+
 fn set_nonblocking(stream: &mut MaybeTlsStream<std::net::TcpStream>) -> std::io::Result<()> {
     match stream {
-        MaybeTlsStream::Plain(s) => s.set_nonblocking(true),
-        MaybeTlsStream::Rustls(s) => s.get_ref().set_nonblocking(true),
+        MaybeTlsStream::Plain(s)   => s.set_nonblocking(true),
+        MaybeTlsStream::Rustls(s)  => s.get_ref().set_nonblocking(true),
         _ => Ok(()),
     }
 }
@@ -459,5 +738,5 @@ fn to_okx_inst(symbol: &str) -> String {
 }
 
 fn from_okx_inst(inst: &str) -> String {
-    inst.replace("-", "")
+    inst.replace('-', "")
 }

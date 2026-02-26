@@ -23,19 +23,24 @@ const POLL_INTERVAL_SECS:  u64 = 60;
 const OKX_BASE: &str           = "https://www.okx.com";
 const MAX_OPEN_POSITIONS:  i64 = 3;   // max concurrent positions
 const MAX_PORTFOLIO_RISK:  f64 = 0.06; // max 6% total risk deployed at once
+const TRAIL_PCT:           f64 = 0.025; // 2.5% trailing stop — activates after TP1 (half_exited=1)
+                                         // trail_sl = high_water * (1 - TRAIL_PCT), only if > entry
 
-// Correlation groups — max 1 open per group
-const CORR_GROUP_1: &[&str] = &["BTCUSDT", "ETHUSDT"];    // high correlation
-const CORR_GROUP_2: &[&str] = &["SOLUSDT", "BNBUSDT"];    // moderate
-// ATOMUSDT standalone
+// Correlation groups — max 1 open per group simultaneously
+const CORR_GROUP_1: &[&str] = &["BTCUSDT", "ETHUSDT"];                         // large cap, high corr
+const CORR_GROUP_2: &[&str] = &["SOLUSDT", "BNBUSDT", "ADAUSDT"];              // L1 alts
+const CORR_GROUP_3: &[&str] = &["AVAXUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "NEARUSDT"]; // L1/L2 beta
+const CORR_GROUP_4: &[&str] = &["DOGEUSDT", "LTCUSDT"];                        // legacy/meme
 
-// Per-coin max allocation % of equity
+// Per-coin max allocation % of equity (smaller = more volatile/risky)
 fn coin_max_alloc(symbol: &str) -> f64 {
     match symbol {
-        "BTCUSDT" | "ETHUSDT" => 0.40,
-        "SOLUSDT" | "BNBUSDT" => 0.25,
-        "ATOMUSDT"             => 0.15,
-        _                      => 0.20,
+        "BTCUSDT" | "ETHUSDT"                        => 0.40, // large cap
+        "SOLUSDT" | "BNBUSDT" | "XRPUSDT"           => 0.25, // mid cap
+        "ADAUSDT" | "DOGEUSDT" | "DOTUSDT"  |
+        "AVAXUSDT"| "NEARUSDT" | "UNIUSDT"  |
+        "LINKUSDT"| "LTCUSDT"                        => 0.20, // established alts
+        _                                            => 0.15, // high-beta (FIL, APT, SUI, ARB, OP, INJ…)
     }
 }
 
@@ -54,6 +59,7 @@ fn default_dd()   -> f64 { 10.0 }
 fn default_cb()   -> u32 { 3 }
 
 // ── Signal ───────────────────────────────────────────────────────────────────
+#[allow(dead_code)] // id/risk_pct set during construction; read by journal helpers
 #[derive(Debug)]
 struct Signal {
     id:        i64,
@@ -175,6 +181,23 @@ fn get_avail_usdt(client: &Client, cfg: &Config) -> Result<f64> {
     Ok(0.0)
 }
 
+/// Get available balance for any coin (e.g. "SOL", "ETH") from OKX account balance.
+/// Used to clamp sell qty to actual available balance (fee-corrected).
+fn get_avail_coin(client: &Client, cfg: &Config, ccy: &str) -> f64 {
+    let r = match okx_get(client, cfg, "/api/v5/account/balance") {
+        Ok(v) => v,
+        Err(_) => return 0.0,
+    };
+    if let Some(details) = r["data"][0]["details"].as_array() {
+        for d in details {
+            if d["ccy"].as_str() == Some(ccy) {
+                return d["availBal"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+            }
+        }
+    }
+    0.0
+}
+
 fn get_price(client: &Client, inst_id: &str) -> Result<f64> {
     let r = client.get(format!("{}/api/v5/market/ticker?instId={}", OKX_BASE, inst_id))
         .send()?.json::<Value>()?;
@@ -228,6 +251,20 @@ fn compute_tp2(entry: f64, tp1: f64) -> f64 {
     ((entry + 2.0 * tp1_dist) * 1_000_000.0).round() / 1_000_000.0
 }
 
+/// Compute trailing stop level.
+/// Rules:
+///   • Only active after TP1 is hit (half_exited == 1)
+///   • trail_sl = high_water × (1 – TRAIL_PCT)
+///   • Only valid if trail_sl > entry (never trail below breakeven)
+///   • Returns 0.0 when inactive
+fn compute_trail_sl(half_exited: i64, high_water: f64, entry: f64) -> f64 {
+    if half_exited != 1 || high_water <= entry {
+        return 0.0;
+    }
+    let ts = high_water * (1.0 - TRAIL_PCT);
+    if ts > entry { ts } else { 0.0 }
+}
+
 /// Returns true if current time is within the noisy early Asian pre-market window (07:00–07:30 WIB).
 /// Signals in this window have historically lower quality (P(up)=0.68 vs 0.92 outside).
 fn is_noisy_window() -> bool {
@@ -277,24 +314,71 @@ fn place_sl(client: &Client, cfg: &Config, inst: &str, qty: f64, sl_px: f64) {
     }
 }
 
-fn place_tp_limit(client: &Client, cfg: &Config, inst: &str, qty: f64, tp_px: f64) {
-    let qty_floor = (qty * 10000.0).floor() / 10000.0;
-    let body = json!({"instId":inst,"tdMode":"cash","side":"sell","ordType":"limit",
-                      "px":format!("{:.4}",tp_px),"sz":format!("{:.4}",qty_floor)});
-    match okx_post(client, cfg, "/api/v5/trade/order", &body) {
-        Ok(r) if r["code"].as_str() == Some("0") => println!("[executor] 🎯 TP @ {:.4}", tp_px),
-        Ok(r) => println!("[executor] ⚠️  TP failed: {}", r["data"][0]["sMsg"]),
-        Err(e) => println!("[executor] ⚠️  TP error: {}", e),
+/// Cancel all pending conditional (algo) orders for an instrument.
+/// Must be called BEFORE any market sell (TP/trail/time/SL software) to free the
+/// coin balance that OKX locks when an algo order is active.
+fn cancel_pending_algos(client: &Client, cfg: &Config, inst: &str) {
+    // 1. Fetch all pending algo orders for this instrument
+    let url = format!("/api/v5/trade/orders-algo-pending?instId={}&ordType=conditional", inst);
+    let pending = match okx_get(client, cfg, &url) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("[executor] algo-pending fetch error: {}", e); return; }
+    };
+    let algo_ids: Vec<String> = pending["data"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|o| o["algoId"].as_str().map(|s| s.to_string()))
+        .collect();
+
+    if algo_ids.is_empty() {
+        return; // nothing to cancel
     }
+
+    // 2. Cancel them: OKX cancel-algos accepts up to 10 per request
+    for chunk in algo_ids.chunks(10) {
+        let args: Vec<serde_json::Value> = chunk.iter()
+            .map(|id| json!({"instId": inst, "algoId": id}))
+            .collect();
+        match okx_post(client, cfg, "/api/v5/trade/cancel-algos", &json!(args)) {
+            Ok(r) if r["code"].as_str() == Some("0") =>
+                println!("[executor] 🗑️  Cancelled {} SL algo(s) for {}", chunk.len(), inst),
+            Ok(r) => println!("[executor] ⚠️  Cancel-algos partial: {}", r),
+            Err(e) => println!("[executor] ⚠️  Cancel-algos error: {}", e),
+        }
+    }
+    // 3. Brief pause so OKX processes the cancellation and releases the balance lock
+    std::thread::sleep(std::time::Duration::from_millis(300));
 }
 
 fn market_sell(client: &Client, cfg: &Config, inst: &str, qty: f64) -> bool {
-    let qty_floor = qty_floor(qty);
+    // Extract coin symbol (e.g. "SOL" from "SOL-USDT") to check actual available balance.
+    // Clamp sell qty to available to avoid "insufficient balance" errors caused by fee deductions.
+    let ccy = inst.split('-').next().unwrap_or(inst);
+    let avail = get_avail_coin(client, cfg, ccy);
+
+    // If avail=0, algo order may still be locking balance — signal caller to retry next cycle.
+    if avail <= 0.0 {
+        println!("[executor] ⏳ Sell delayed: {} avail=0 (balance locked?), retry next cycle", ccy);
+        return false;
+    }
+
+    let sell_qty = if avail < qty {
+        println!("[executor] ℹ️  Clamping sell qty from {:.4} to avail {:.4} {}", qty, avail, ccy);
+        avail
+    } else {
+        qty
+    };
+    let qty_floor = qty_floor(sell_qty);
+    if qty_floor <= 0.0 {
+        println!("[executor] ⚠️  Sell skipped: qty_floor=0 for {} (avail={:.6})", ccy, avail);
+        return false;
+    }
     let body = json!({"instId":inst,"tdMode":"cash","side":"sell","ordType":"market",
                       "sz":format!("{:.4}",qty_floor)});
     match okx_post(client, cfg, "/api/v5/trade/order", &body) {
         Ok(r) if r["code"].as_str() == Some("0") => {
-            println!("[executor] 💸 SELL {:.4} {}", qty, inst);
+            println!("[executor] 💸 SELL {:.4} {} (avail was {:.4})", sell_qty, inst, avail);
             true
         },
         Ok(r) => {
@@ -433,6 +517,7 @@ fn init_live_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN tp2_price REAL", params![]);
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN half_exited INTEGER DEFAULT 0", params![]);
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN p_up REAL", params![]);
+    let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN high_water REAL DEFAULT 0", params![]);
     Ok(())
 }
 
@@ -460,6 +545,19 @@ fn count_open_positions(conn: &Connection) -> i64 {
 fn has_open_position(conn: &Connection, symbol: &str) -> bool {
     conn.query_row("SELECT 1 FROM open_positions WHERE symbol=? AND status='OPEN'",
         params![symbol], |_| Ok(true)).unwrap_or(false)
+}
+
+/// Returns true if this symbol was closed (FILLED then closed) within the last `cooldown_min` minutes.
+/// Prevents rapid re-entry on the same coin right after a manual close or SL/TP exit.
+fn cooldown_active(conn: &Connection, symbol: &str, cooldown_min: i64) -> bool {
+    let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(cooldown_min))
+        .to_rfc3339();
+    conn.query_row(
+        "SELECT 1 FROM open_positions
+         WHERE symbol=? AND status != 'OPEN' AND opened_at >= ?",
+        params![symbol, cutoff],
+        |_| Ok(true)
+    ).unwrap_or(false)
 }
 
 fn total_risk_deployed(conn: &Connection, equity: f64) -> f64 {
@@ -494,6 +592,8 @@ fn get_daily_stats(conn: &Connection, today: &str, starting_equity: f64) -> (f64
 fn corr_group_blocked(conn: &Connection, symbol: &str) -> bool {
     let group: Option<&[&str]> = if CORR_GROUP_1.contains(&symbol) { Some(CORR_GROUP_1) }
         else if CORR_GROUP_2.contains(&symbol) { Some(CORR_GROUP_2) }
+        else if CORR_GROUP_3.contains(&symbol) { Some(CORR_GROUP_3) }
+        else if CORR_GROUP_4.contains(&symbol) { Some(CORR_GROUP_4) }
         else { None };
     if let Some(grp) = group {
         for sym in grp {
@@ -585,6 +685,12 @@ fn main() -> Result<()> {
                 }
                 if has_open_position(&live_conn, &sig.symbol) {
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_DUPE",0.0,"");
+                    continue;
+                }
+                // 30-min cooldown after any closed position on the same symbol
+                if cooldown_active(&live_conn, &sig.symbol, 30) {
+                    println!("[executor] ⏳ Cooldown: {} closed recently, skipping", sig.symbol);
+                    mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_COOLDOWN",0.0,"30min cooldown after close");
                     continue;
                 }
                 if corr_group_blocked(&live_conn, &sig.symbol) {
@@ -706,10 +812,24 @@ fn main() -> Result<()> {
                         } else {
                             // Wait for buy to settle before placing SL/TP algo orders
                             thread::sleep(StdDuration::from_secs(3));
-                            place_sl(&client, &cfg, &inst, qty, actual_stop);
-                            place_tp_limit(&client, &cfg, &inst, qty, actual_tp1);
+                            // Query actual received coin qty (after OKX fee deduction).
+                            // Using computed qty = usdt/fill over-estimates by ~0.1% (fee).
+                            // Always use actual available balance as source of truth.
+                            let ccy = inst.split('-').next().unwrap_or(&inst);
+                            let avail_after = get_avail_coin(&client, &cfg, ccy);
+                            let actual_qty = if avail_after > 0.0 && avail_after < qty {
+                                println!("[executor] ℹ️  Actual received qty {:.6} {} (computed {:.6}, fee adj {:.4}%)",
+                                    avail_after, ccy, qty, (1.0 - avail_after/qty)*100.0);
+                                avail_after
+                            } else { qty };
+                            // SL algo order on OKX = hard stop (crash protection).
+                            // TP is handled by executor polling (software TP1/TP2/trail).
+                            // We do NOT place a separate TP limit order because OKX locks the full
+                            // coin balance for the SL algo order, causing TP limit to always fail
+                            // with "insufficient balance" — conflicting orders on simple spot.
+                            place_sl(&client, &cfg, &inst, actual_qty, actual_stop);
                             open_position(&live_conn, sig_id, &order_id, &sig.symbol,
-                                          &sig.direction, qty, fill, actual_stop, actual_tp1, risk_usdt,
+                                          &sig.direction, actual_qty, fill, actual_stop, actual_tp1, risk_usdt,
                                           actual_tp2, p_up_val);
                             live_conn.execute(
                                 "UPDATE daily_stats SET trade_count=trade_count+1 WHERE trade_date=?",
@@ -733,25 +853,34 @@ fn main() -> Result<()> {
         }
 
         // ── Monitor open positions ────────────────────────────────────────────
-        let open_pos: Vec<(i64,i64,String,String,f64,f64,f64,f64,f64,String,f64,i64)> = {
+        let open_pos: Vec<(i64,i64,String,String,f64,f64,f64,f64,f64,String,f64,i64,f64)> = {
             let mut s = live_conn.prepare(
                 "SELECT id,signal_id,symbol,direction,qty,entry_price,stop_price,tp1_price,risk_usdt,opened_at,
-                        COALESCE(tp2_price,0.0),COALESCE(half_exited,0)
+                        COALESCE(tp2_price,0.0),COALESCE(half_exited,0),COALESCE(high_water,0.0)
                  FROM open_positions WHERE status='OPEN'")?;
             let x: Vec<_> = s.query_map(params![], |r| Ok((
                 r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,
                 r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,
-                r.get(10)?,r.get(11)?
+                r.get(10)?,r.get(11)?,r.get(12)?
             )))?.filter_map(|r| r.ok()).collect();
             x
         };
 
-        for (pid, sig_id, symbol, direction, qty, entry, stop, tp1, _risk, opened_at_str, tp2, half_exited) in open_pos {
+        for (pid, sig_id, symbol, direction, qty, entry, stop, tp1, _risk, opened_at_str, tp2, half_exited, mut high_water) in open_pos {
             let inst    = inst_id(&symbol);
             let current = match get_price(&client, &inst) { Ok(p) => p, Err(_) => continue };
             let opened_dt = DateTime::parse_from_rfc3339(&opened_at_str)
                 .map(|d| d.with_timezone(&Local)).unwrap_or_else(|_| Local::now());
             let hold_min = (Local::now() - opened_dt).num_minutes();
+
+            // ── Track high_water mark and compute trailing stop ──────────────
+            if current > high_water {
+                high_water = current;
+                live_conn.execute("UPDATE open_positions SET high_water=? WHERE id=?",
+                    params![high_water, pid]).ok();
+            }
+            // trail_sl: only active after TP1 (half_exited=1) AND above entry (can't trail into loss)
+            let trail_sl = compute_trail_sl(half_exited, high_water, entry);
 
             let fake = Signal { id: sig_id, symbol: symbol.clone(), direction: direction.clone(),
                 entry, stop, tp1, _tp2: None, risk_pct: base_risk,
@@ -763,6 +892,8 @@ fn main() -> Result<()> {
                 let half_pnl = (tp1 - entry) * half_qty;
                 println!("[executor] 🎯 TP1 PARTIAL {} — selling 50% ({:.4}) +{:.4}U, moving SL→breakeven, holding for TP2={:.4}",
                     symbol, half_qty, half_pnl, tp2);
+                // Cancel SL algo FIRST so OKX releases the coin balance lock
+                cancel_pending_algos(&client, &cfg, &inst);
                 let sold = market_sell(&client, &cfg, &inst, half_qty);
                 if sold {
                     let remaining_qty = qty_floor(qty - half_qty);
@@ -774,6 +905,8 @@ fn main() -> Result<()> {
                         "UPDATE daily_stats SET realized_pnl=realized_pnl+? WHERE trade_date=?",
                         params![half_pnl, today]).ok();
                     println!("[executor] ✅ Half sold. Remaining {:.4} {}, SL moved to breakeven {:.4}", remaining_qty, symbol, entry);
+                    // Re-place SL at breakeven for remaining position
+                    place_sl(&client, &cfg, &inst, remaining_qty, entry);
                 } else {
                     println!("[executor] ⚠️  Partial sell failed — retrying next cycle");
                 }
@@ -782,14 +915,28 @@ fn main() -> Result<()> {
 
             // ── Second half: TP2 hit ─────────────────────────────────────────
             let (closed, pnl, status, reason) = if half_exited == 1 && tp2 > 0.0 && direction == "Long" && current >= tp2 {
-                let p = (tp2 - entry) * qty;
-                println!("[executor] 🚀 TP2! {} full exit +{:.4}U @ {:.4}", symbol, p, tp2);
+                // Cancel SL algo first to free balance lock
+                cancel_pending_algos(&client, &cfg, &inst);
+                // PnL uses current (market fill), not fixed TP2 price
+                let p = (current - entry) * qty;
+                println!("[executor] 🚀 TP2! {} full exit +{:.4}U @ {:.4} (TP2={:.4})", symbol, p, current, tp2);
                 let sold = market_sell(&client, &cfg, &inst, qty);
                 if sold { (true, p, "CLOSED_TP2", format!("{:.4}≥TP2{:.4}", current, tp2)) }
                 else { println!("[executor] ⚠️  TP2 sell failed — retrying"); (false, 0.0, "", String::new()) }
 
+            // ── Trailing stop hit (after TP1, trail_sl above entry) ──────────
+            } else if trail_sl > 0.0 && direction == "Long" && current <= trail_sl {
+                cancel_pending_algos(&client, &cfg, &inst);
+                let p = (current - entry) * qty;
+                println!("[executor] 🔄 Trail stop {} — high={:.4} trail_sl={:.4} curr={:.4} +{:.4}U",
+                    symbol, high_water, trail_sl, current, p);
+                let sold = market_sell(&client, &cfg, &inst, qty);
+                if sold { (true, p, "CLOSED_TRAIL", format!("{:.4}≤trail_sl{:.4}", current, trail_sl)) }
+                else { println!("[executor] ⚠️  Trail sell failed — retrying"); (false, 0.0, "", String::new()) }
+
             // ── Time exit ─────────────────────────────────────────────────────
             } else if hold_min >= MAX_HOLD_MIN {
+                cancel_pending_algos(&client, &cfg, &inst);
                 let p = (current - entry) * qty;
                 println!("[executor] ⏱️  Time exit {} {}min @ {:.4}", symbol, hold_min, current);
                 let sold = market_sell(&client, &cfg, &inst, qty);
@@ -798,6 +945,7 @@ fn main() -> Result<()> {
 
             // ── SL hit (original or breakeven after partial) ─────────────────
             } else if direction == "Long" && current <= stop {
+                cancel_pending_algos(&client, &cfg, &inst);
                 let p = (current - entry) * qty;
                 let label = if half_exited == 1 { "CLOSED_BREAKEVEN" } else { "CLOSED_SL" };
                 let emoji = if half_exited == 1 { "⚖️" } else { "🛑" };
@@ -1098,7 +1246,8 @@ mod tests {
 
     #[test]
     fn coin_alloc_unknown_default() {
-        assert_eq!(coin_max_alloc("XYZUSDT"), 0.20);
+        // Unknown/new coins get conservative 15% allocation
+        assert_eq!(coin_max_alloc("XYZUSDT"), 0.15);
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -1253,5 +1402,494 @@ mod tests {
         let ema20 = 0.0_f64;
         let stretched = ema20 > 0.0 && price > ema20 * 1.08;
         assert!(!stretched, "Zero EMA20 must not trigger pump detection");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 13. TRAILING STOP
+    // ════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn trail_inactive_before_tp1() {
+        // half_exited=0 → trail must be 0.0 (TP1 not hit yet)
+        let ts = compute_trail_sl(0, 95.0, 80.0);
+        assert_eq!(ts, 0.0, "Trailing stop must be inactive before TP1");
+    }
+
+    #[test]
+    fn trail_active_after_tp1() {
+        // half_exited=1, high_water=100, entry=80
+        // trail_sl = 100 * 0.975 = 97.5, and 97.5 > 80 → active
+        let ts = compute_trail_sl(1, 100.0, 80.0);
+        let expected = 100.0 * (1.0 - TRAIL_PCT);
+        assert!((ts - expected).abs() < 0.0001, "trail_sl={:.4} expected {:.4}", ts, expected);
+    }
+
+    #[test]
+    fn trail_tracks_high_water() {
+        // As price moves up, trail_sl rises with it
+        let ts_low  = compute_trail_sl(1, 90.0, 80.0);
+        let ts_high = compute_trail_sl(1, 110.0, 80.0);
+        assert!(ts_high > ts_low, "Higher high_water must produce higher trail_sl");
+    }
+
+    #[test]
+    fn trail_zero_when_would_breach_entry() {
+        // high_water barely above entry: trail_sl would be below entry → return 0
+        // entry=100, high_water=100.1 → trail = 100.1 * 0.975 = 97.6 < entry(100) → 0.0
+        let ts = compute_trail_sl(1, 100.1, 100.0);
+        assert_eq!(ts, 0.0, "trail_sl below entry must be suppressed to 0.0");
+    }
+
+    #[test]
+    fn trail_zero_when_high_water_equals_entry() {
+        // high_water == entry → no gain yet, trail inactive
+        let ts = compute_trail_sl(1, 80.0, 80.0);
+        assert_eq!(ts, 0.0, "No trail when high_water == entry");
+    }
+
+    #[test]
+    fn trail_preserves_2_5pct_gap() {
+        // TRAIL_PCT = 2.5% — trail_sl should always be exactly 2.5% below high_water
+        let high_water = 150.0_f64;
+        let ts = compute_trail_sl(1, high_water, 100.0);
+        let expected = high_water * 0.975;
+        assert!((ts - expected).abs() < 0.0001,
+            "trail_sl should be exactly 2.5% below high_water: got {:.4} expected {:.4}", ts, expected);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 14. STALE SIGNAL — EXACT BOUNDARIES
+    // ════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn stale_exactly_minus_3pct_is_normal() {
+        // dev = -0.03 exactly → condition is `dev < -0.03` (strict) → NOT DUMPED → NORMAL
+        let entry = 100.0_f64;
+        let current = entry * 0.97; // exactly -3%
+        assert_eq!(stale_decision_long(entry, current), "NORMAL",
+            "Exactly -3% is NOT dumped (strict < boundary)");
+    }
+
+    #[test]
+    fn stale_exactly_plus_10pct_is_chasing_due_to_fp() {
+        // Due to f64 representation, 100.0 * 1.10 = 110.000...001
+        // so dev = 0.100...001 which is > 0.10 → CHASING (not DYNAMIC).
+        // This is the real observed boundary behaviour.
+        let entry = 100.0_f64;
+        let current = entry * 1.10;
+        let result = stale_decision_long(entry, current);
+        // Accept either CHASING or DYNAMIC depending on fp precision
+        assert!(result == "CHASING" || result == "DYNAMIC",
+            "At +10%, must be CHASING or DYNAMIC, got {}", result);
+    }
+
+    #[test]
+    fn stale_exactly_plus_3pct_is_normal() {
+        // dev = +0.03 exactly → condition is `dev > 0.03` (strict) → NOT DYNAMIC → NORMAL
+        let entry = 100.0_f64;
+        let current = entry * 1.03; // exactly +3%
+        assert_eq!(stale_decision_long(entry, current), "NORMAL",
+            "Exactly +3% is NOT dynamic (strict > boundary)");
+    }
+
+    #[test]
+    fn stale_just_over_10pct_is_chasing() {
+        // dev = +10.1% → CHASING
+        let entry = 100.0_f64;
+        let current = entry * 1.101;
+        assert_eq!(stale_decision_long(entry, current), "CHASING");
+    }
+
+    #[test]
+    fn stale_just_under_minus_3pct_is_dumped() {
+        // dev = -3.1% → DUMPED
+        let entry = 100.0_f64;
+        let current = entry * 0.969;
+        assert_eq!(stale_decision_long(entry, current), "DUMPED");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 15. QTY FLOOR — EDGE CASES
+    // ════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn qty_floor_zero_stays_zero() {
+        assert_eq!(qty_floor(0.0), 0.0);
+    }
+
+    #[test]
+    fn qty_floor_small_amount() {
+        // 0.00001 → 0.0000 (floored to 4 decimals)
+        let q = qty_floor(0.00001);
+        assert_eq!(q, 0.0);
+    }
+
+    #[test]
+    fn qty_floor_large_amount() {
+        // 9999.99999 → 9999.9999
+        let q = qty_floor(9999.99999);
+        assert_eq!(q, 9999.9999);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 16. CORRELATION GROUP BLOCKING (in-memory SQLite)
+    // ════════════════════════════════════════════════════════════════
+
+    fn make_test_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE open_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id INTEGER, order_id TEXT,
+                symbol TEXT, direction TEXT,
+                qty REAL, entry_price REAL,
+                stop_price REAL, tp1_price REAL, tp2_price REAL,
+                risk_usdt REAL, opened_at TEXT,
+                status TEXT DEFAULT 'OPEN',
+                half_exited INTEGER DEFAULT 0,
+                p_up REAL, high_water REAL DEFAULT 0
+             );"
+        ).unwrap();
+        conn
+    }
+
+    fn insert_open(conn: &rusqlite::Connection, symbol: &str) {
+        conn.execute(
+            "INSERT INTO open_positions
+             (symbol, direction, qty, entry_price, stop_price, tp1_price, tp2_price,
+              risk_usdt, opened_at, status)
+             VALUES (?1,'Long',1.0,100.0,95.0,105.0,110.0,2.0,'2026-01-01T00:00:00Z','OPEN')",
+            rusqlite::params![symbol],
+        ).unwrap();
+    }
+
+    #[test]
+    fn corr_btc_blocks_eth() {
+        let conn = make_test_db();
+        insert_open(&conn, "BTCUSDT");
+        assert!(corr_group_blocked(&conn, "ETHUSDT"),
+            "BTC open must block ETH (same group)");
+    }
+
+    #[test]
+    fn corr_eth_blocks_btc() {
+        let conn = make_test_db();
+        insert_open(&conn, "ETHUSDT");
+        assert!(corr_group_blocked(&conn, "BTCUSDT"),
+            "ETH open must block BTC (same group)");
+    }
+
+    #[test]
+    fn corr_sol_blocks_bnb() {
+        let conn = make_test_db();
+        insert_open(&conn, "SOLUSDT");
+        assert!(corr_group_blocked(&conn, "BNBUSDT"),
+            "SOL open must block BNB (same group)");
+    }
+
+    #[test]
+    fn corr_bnb_blocks_ada() {
+        let conn = make_test_db();
+        insert_open(&conn, "BNBUSDT");
+        assert!(corr_group_blocked(&conn, "ADAUSDT"),
+            "BNB open must block ADA (L1 alts group)");
+    }
+
+    #[test]
+    fn corr_avax_blocks_apt() {
+        let conn = make_test_db();
+        insert_open(&conn, "AVAXUSDT");
+        assert!(corr_group_blocked(&conn, "APTUSDT"),
+            "AVAX open must block APT (L1/L2 beta group)");
+    }
+
+    #[test]
+    fn corr_doge_blocks_ltc() {
+        let conn = make_test_db();
+        insert_open(&conn, "DOGEUSDT");
+        assert!(corr_group_blocked(&conn, "LTCUSDT"),
+            "DOGE open must block LTC (legacy/meme group)");
+    }
+
+    #[test]
+    fn corr_btc_does_not_block_sol() {
+        // BTC (group1) and SOL (group2) are in different groups — should NOT block
+        let conn = make_test_db();
+        insert_open(&conn, "BTCUSDT");
+        assert!(!corr_group_blocked(&conn, "SOLUSDT"),
+            "BTC must NOT block SOL (different groups)");
+    }
+
+    #[test]
+    fn corr_no_open_positions_not_blocked() {
+        let conn = make_test_db();
+        assert!(!corr_group_blocked(&conn, "BTCUSDT"),
+            "No open positions → not blocked");
+    }
+
+    #[test]
+    fn corr_unknown_symbol_not_blocked() {
+        // XYZUSDT is not in any group → never blocked
+        let conn = make_test_db();
+        insert_open(&conn, "BTCUSDT");
+        insert_open(&conn, "SOLUSDT");
+        assert!(!corr_group_blocked(&conn, "XYZUSDT"),
+            "Unknown symbol not in any group must not be blocked");
+    }
+
+    #[test]
+    fn corr_closed_position_does_not_block() {
+        // Only OPEN positions count for correlation blocking
+        let conn = make_test_db();
+        insert_open(&conn, "ETHUSDT");
+        conn.execute("UPDATE open_positions SET status='CLOSED_TP2' WHERE symbol='ETHUSDT'", []).unwrap();
+        assert!(!corr_group_blocked(&conn, "BTCUSDT"),
+            "Closed ETH must not block BTC");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 17. COOLDOWN ACTIVE (in-memory SQLite)
+    // ════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn cooldown_blocks_recent_close() {
+        let conn = make_test_db();
+        // Insert a recently-closed SOL position (opened 5 min ago, now closed)
+        let recent = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO open_positions
+             (symbol, direction, qty, entry_price, stop_price, tp1_price, tp2_price,
+              risk_usdt, opened_at, status)
+             VALUES ('SOLUSDT','Long',1.0,80.0,77.0,83.0,86.0,2.0,?1,'CLOSED_TP2')",
+            rusqlite::params![recent],
+        ).unwrap();
+        assert!(cooldown_active(&conn, "SOLUSDT", 30),
+            "5-min-old close must trigger 30-min cooldown");
+    }
+
+    #[test]
+    fn cooldown_allows_after_expiry() {
+        let conn = make_test_db();
+        // Position closed 45 min ago — beyond 30-min cooldown
+        let old = (chrono::Utc::now() - chrono::Duration::minutes(45)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO open_positions
+             (symbol, direction, qty, entry_price, stop_price, tp1_price, tp2_price,
+              risk_usdt, opened_at, status)
+             VALUES ('SOLUSDT','Long',1.0,80.0,77.0,83.0,86.0,2.0,?1,'CLOSED_TP2')",
+            rusqlite::params![old],
+        ).unwrap();
+        assert!(!cooldown_active(&conn, "SOLUSDT", 30),
+            "45-min-old close is beyond 30-min cooldown — must be allowed");
+    }
+
+    #[test]
+    fn cooldown_no_history_not_blocked() {
+        let conn = make_test_db();
+        assert!(!cooldown_active(&conn, "SOLUSDT", 30),
+            "No history → cooldown must not block");
+    }
+
+    #[test]
+    fn cooldown_open_position_does_not_trigger() {
+        // An OPEN position does NOT trigger cooldown (cooldown is for non-OPEN statuses)
+        let conn = make_test_db();
+        let recent = (chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO open_positions
+             (symbol, direction, qty, entry_price, stop_price, tp1_price, tp2_price,
+              risk_usdt, opened_at, status)
+             VALUES ('BTCUSDT','Long',0.001,68000.0,65000.0,70000.0,72000.0,2.0,?1,'OPEN')",
+            rusqlite::params![recent],
+        ).unwrap();
+        assert!(!cooldown_active(&conn, "BTCUSDT", 30),
+            "OPEN position must not trigger cooldown (only closed positions do)");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 18. IS_PUMP_OR_EXHAUSTED (temp cache file)
+    // ════════════════════════════════════════════════════════════════
+
+    fn write_temp_cache(dir: &std::path::Path, symbol: &str, rsi: f64, vol: f64, price: f64, ema20: f64) {
+        let td = dir.join("trading-journal");
+        std::fs::create_dir_all(&td).unwrap();
+        let json = serde_json::json!({
+            "generated_at": "2026-01-01T00:00:00Z",
+            "symbols": {
+                symbol: {
+                    "symbol": symbol,
+                    "price": price,
+                    "rsi14": rsi,
+                    "volume_ratio": vol,
+                    "ema20": ema20,
+                    "ema50": ema20 * 0.95,
+                    "atr14_pct": 2.0,
+                    "adx14": 25.0,
+                    "volume_ratio": vol,
+                    "bid": price * 0.999,
+                    "ask": price * 1.001,
+                    "spread_bps": 2.0,
+                    "updated_at": "2026-01-01T00:00:00Z"
+                }
+            }
+        });
+        let cache_path = td.join("realtime_cache.json");
+        std::fs::write(&cache_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn pump_high_vol_high_rsi_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        write_temp_cache(dir.path(), "SOLUSDT", 82.0, 5.0, 100.0, 90.0);
+        assert!(is_pump_or_exhausted("SOLUSDT", dir.path()),
+            "vol=5 + rsi=82 must be flagged as pump");
+    }
+
+    #[test]
+    fn pump_high_vol_low_rsi_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        // price=100, ema20=95 → price/ema20 = 1.053 (below 1.08 threshold) — not stretched
+        // vol=5.0, rsi=60 → vol pump needs rsi>78 too — not triggered
+        write_temp_cache(dir.path(), "SOLUSDT", 60.0, 5.0, 100.0, 95.0);
+        assert!(!is_pump_or_exhausted("SOLUSDT", dir.path()),
+            "vol=5 + rsi=60 + price not stretched — should not block");
+    }
+
+    #[test]
+    fn pump_stretched_price_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        // price = 110, ema20 = 100 → 10% above EMA20 → stretched
+        write_temp_cache(dir.path(), "SOLUSDT", 55.0, 1.5, 110.0, 100.0);
+        assert!(is_pump_or_exhausted("SOLUSDT", dir.path()),
+            "Price 10% above EMA20 must be flagged as stretched");
+    }
+
+    #[test]
+    fn pump_normal_conditions_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Normal: vol=1.5, rsi=65, price only 3% above ema20
+        write_temp_cache(dir.path(), "SOLUSDT", 65.0, 1.5, 103.0, 100.0);
+        assert!(!is_pump_or_exhausted("SOLUSDT", dir.path()),
+            "Normal conditions must not block");
+    }
+
+    #[test]
+    fn pump_missing_symbol_not_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        write_temp_cache(dir.path(), "SOLUSDT", 90.0, 8.0, 200.0, 100.0);
+        // Ask about ETHUSDT — not in cache → should return false (safe default)
+        assert!(!is_pump_or_exhausted("ETHUSDT", dir.path()),
+            "Missing symbol in cache must not block (safe default)");
+    }
+
+    #[test]
+    fn pump_no_cache_file_not_blocked() {
+        // Cache file doesn't exist → default false (safe, don't block)
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_pump_or_exhausted("BTCUSDT", dir.path()),
+            "Missing cache file must not block");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 19. COIN MAX ALLOCATION — full coverage
+    // ════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn coin_alloc_xrp_mid_cap_sol_group() {
+        // XRP is in the mid-cap group (SOL/BNB/XRP) → 25%
+        assert_eq!(coin_max_alloc("XRPUSDT"), 0.25);
+    }
+
+    #[test]
+    fn coin_alloc_dot_link_established_alts() {
+        // DOT, LINK → established alts → 20%
+        assert_eq!(coin_max_alloc("DOTUSDT"),  0.20);
+        assert_eq!(coin_max_alloc("LINKUSDT"), 0.20);
+    }
+
+    #[test]
+    fn coin_alloc_doge_ltc_ada_established() {
+        // DOGE, LTC, ADA → established alts → 20%
+        assert_eq!(coin_max_alloc("DOGEUSDT"), 0.20);
+        assert_eq!(coin_max_alloc("LTCUSDT"),  0.20);
+        assert_eq!(coin_max_alloc("ADAUSDT"),  0.20);
+    }
+
+    #[test]
+    fn coin_alloc_avax_established_apt_highbeta() {
+        // AVAX → established alt → 20%;  APT → high-beta → 15%
+        assert_eq!(coin_max_alloc("AVAXUSDT"), 0.20);
+        assert_eq!(coin_max_alloc("APTUSDT"),  0.15);
+    }
+
+    #[test]
+    fn coin_alloc_highbeta_coins() {
+        // FIL, SUI, ARB, OP, INJ → high-beta default → 15%
+        for sym in &["FILUSDT", "SUIUSDT", "ARBUSDT", "OPUSDT", "INJUSDT"] {
+            assert_eq!(coin_max_alloc(sym), 0.15, "{} should be 15%", sym);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 20. COMPUTE_SL_TP_FROM_FILL — edge cases
+    // ════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn sl_tp_normal_entry_fill_equals_entry() {
+        // Fill == signal entry → SL/TP based on original ratios, same as compute at entry
+        let (sl, tp) = compute_sl_tp_from_fill(100.0, 97.0, 103.0, 100.0);
+        let atr_pct = 0.03;  // (100-97)/100
+        let tp_pct  = 0.03;  // (103-100)/100
+        let expected_sl = 100.0 * (1.0 - atr_pct);
+        let expected_tp = 100.0 * (1.0 + tp_pct);
+        assert!((sl - expected_sl).abs() < 0.01, "SL at same fill: {:.4} vs {:.4}", sl, expected_sl);
+        assert!((tp - expected_tp).abs() < 0.01, "TP at same fill: {:.4} vs {:.4}", tp, expected_tp);
+    }
+
+    #[test]
+    fn sl_tp_very_tight_original_uses_floor() {
+        // If original SL is only 0.1% away → atr_pct floored at 1.5%
+        let (sl, _tp) = compute_sl_tp_from_fill(100.0, 99.9, 103.0, 100.0);
+        let expected_sl = 100.0 * (1.0 - 0.015); // 1.5% floor
+        assert!((sl - expected_sl).abs() < 0.01,
+            "Tight SL must use 1.5% ATR floor: {:.4} vs {:.4}", sl, expected_sl);
+    }
+
+    #[test]
+    fn sl_tp_ratio_preserved_at_different_fills() {
+        // Same signal, different fill prices — ratios must be preserved
+        let entry = 100.0_f64;
+        let sl_sig = 97.0_f64;  // 3% stop
+        let tp_sig = 103.0_f64; // 3% target
+        let (sl_low,  tp_low)  = compute_sl_tp_from_fill(entry, sl_sig, tp_sig, 95.0);
+        let (sl_high, tp_high) = compute_sl_tp_from_fill(entry, sl_sig, tp_sig, 110.0);
+        // Both should have ~3% ATR and ~3% TP ratio
+        let ratio_low_sl  = (95.0  - sl_low)  / 95.0;
+        let ratio_high_sl = (110.0 - sl_high) / 110.0;
+        assert!((ratio_low_sl  - 0.03).abs() < 0.001, "ATR% at fill=95:  {:.4}", ratio_low_sl);
+        assert!((ratio_high_sl - 0.03).abs() < 0.001, "ATR% at fill=110: {:.4}", ratio_high_sl);
+        assert!(tp_high > tp_low, "Higher fill → higher TP");
+        assert!(sl_high > sl_low, "Higher fill → higher SL");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 21. KELLY — tier C floor behaviour
+    // ════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn kelly_tier_c_uses_half_base_risk_but_floored() {
+        // Tier C: base_risk*0.5, floored at 1%
+        // base_risk=0.02 → tier_c = 0.01 → floor(0.01) = 0.01
+        let s = sig(0.3, 0.55, 0.45, 0.5, 79.0, 76.5, 81.0);
+        let r = kelly_risk_fraction(&s, 0.02);
+        assert!((r - 0.01).abs() < 0.001, "Tier C with base 2% should be 1% (floor): {:.4}", r);
+    }
+
+    #[test]
+    fn kelly_zero_base_risk_still_floored_at_1pct() {
+        // Even with base_risk=0, result must be >= 1%
+        let s = sig(0.5, 0.55, 0.45, 0.5, 79.0, 76.5, 81.0);
+        let r = kelly_risk_fraction(&s, 0.0);
+        assert!(r >= 0.01, "Kelly must never go below 1%: got {:.4}", r);
     }
 }

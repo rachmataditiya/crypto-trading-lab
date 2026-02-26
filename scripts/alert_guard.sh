@@ -86,18 +86,29 @@ msg = (
     f"💰 Mode: LIVE OKX — order NYATA"
 )
 
-# Send via openclaw CLI
-import shutil
-oc = shutil.which("openclaw") or "/Users/rachmataditiya/.local/bin/openclaw"
-result = subprocess.run(
-    [oc, "message", "send", "--channel", "whatsapp",
-     "--target", "+6281268289854", "--message", msg],
-    capture_output=True, text=True
-)
-if result.returncode == 0:
-    print(f"[{t_time}] ✅ Alert sent for PAPER_TRADE id={sig_id} {symbol} {entry}→{tp1}")
+# Send via openclaw CLI — use absolute path to avoid LaunchAgent PATH issues
+import shutil, os
+_candidates = [
+    "/Users/rachmataditiya/.local/bin/openclaw",
+    "/usr/local/bin/openclaw",
+]
+oc = next((p for p in _candidates if os.path.isfile(p)), None)
+if not oc:
+    # fallback: shutil.which but verify the file actually exists
+    _w = shutil.which("openclaw")
+    oc = _w if (_w and os.path.isfile(_w)) else None
+if not oc:
+    print(f"[{t_time}] ⚠️ openclaw not found, skipping alert")
 else:
-    print(f"[{t_time}] ⚠️ Send failed: {result.stderr[:200]}")
+    result = subprocess.run(
+        [oc, "message", "send", "--channel", "whatsapp",
+         "--target", "+6281268289854", "--message", msg],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print(f"[{t_time}] ✅ Alert sent for PAPER_TRADE id={sig_id} {symbol} {entry}→{tp1}")
+    else:
+        print(f"[{t_time}] ⚠️ Send failed: {result.stderr[:200]}")
 
 # Mark as alerted in tracker file
 alerted.append(str(sig_id))
