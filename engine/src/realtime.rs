@@ -740,3 +740,97 @@ fn to_okx_inst(symbol: &str) -> String {
 fn from_okx_inst(inst: &str) -> String {
     inst.replace('-', "")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Build a candle WS push array as OKX sends it:
+    /// outer = [inner_row], inner = [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
+    fn candle_row(close: &str, confirm: &str) -> Vec<serde_json::Value> {
+        vec![json!(["1700000000000", "100.0", "105.0", "98.0", close,
+                    "1000.0", "100000.0", "100000.0", confirm])]
+    }
+
+    // ── confirmed_close ────────────────────────────────────────────────────
+
+    #[test]
+    fn confirmed_close_returns_price_when_confirmed() {
+        let arr = candle_row("86.39", "1");
+        let result = confirmed_close(&arr);
+        assert!(result.is_some(), "confirm=1 must return Some(close)");
+        assert!((result.unwrap() - 86.39).abs() < 0.001,
+            "Close value must match: {:.4}", result.unwrap());
+    }
+
+    #[test]
+    fn confirmed_close_returns_none_when_unconfirmed() {
+        let arr = candle_row("86.39", "0");
+        assert!(confirmed_close(&arr).is_none(),
+            "confirm=0 (in-progress candle) must return None");
+    }
+
+    #[test]
+    fn confirmed_close_returns_none_for_empty_outer_array() {
+        let arr: Vec<serde_json::Value> = vec![];
+        assert!(confirmed_close(&arr).is_none(),
+            "Empty outer array must return None");
+    }
+
+    #[test]
+    fn confirmed_close_returns_none_for_empty_inner_row() {
+        let arr = vec![json!([])];
+        assert!(confirmed_close(&arr).is_none(),
+            "Empty inner row must return None");
+    }
+
+    #[test]
+    fn confirmed_close_returns_none_when_confirm_field_missing() {
+        // Inner row has only 8 elements — no confirm at index 8
+        let arr = vec![json!(["1700000000000", "100.0", "105.0", "98.0",
+                               "86.39", "1000.0", "100000.0", "100000.0"])];
+        assert!(confirmed_close(&arr).is_none(),
+            "Missing confirm field must return None (safe default)");
+    }
+
+    #[test]
+    fn confirmed_close_returns_none_for_unparseable_close() {
+        // confirm=1 but close is not a valid f64
+        let arr = vec![json!(["1700000000000", "100.0", "105.0", "98.0",
+                               "NOT_A_NUMBER", "1000.0", "100000.0", "100000.0", "1"])];
+        assert!(confirmed_close(&arr).is_none(),
+            "Non-numeric close must return None even when confirmed");
+    }
+
+    #[test]
+    fn confirmed_close_rejects_numeric_confirm_field() {
+        // confirm field is integer 1 (not string "1") — must be treated as unconfirmed
+        let arr = vec![json!(["1700000000000", "100.0", "105.0", "98.0",
+                               "86.39", "1000.0", "100000.0", "100000.0", 1])];
+        assert!(confirmed_close(&arr).is_none(),
+            "Numeric 1 in confirm field must not match string '1'");
+    }
+
+    // ── push_close (deque bounded growth) ─────────────────────────────────
+
+    #[test]
+    fn push_close_respects_max_size() {
+        let mut dq: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
+        for i in 0..150 {
+            push_close(&mut dq, i as f64, 120);
+        }
+        assert_eq!(dq.len(), 120, "Deque must not exceed max=120");
+    }
+
+    #[test]
+    fn push_close_evicts_oldest_first() {
+        let mut dq: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
+        for i in 0..5 {
+            push_close(&mut dq, i as f64, 3);
+        }
+        // After pushing 0,1,2,3,4 with max=3, should have [2,3,4]
+        assert_eq!(dq[0], 2.0, "Oldest must be evicted first");
+        assert_eq!(dq[2], 4.0, "Newest must be at back");
+    }
+}

@@ -18,7 +18,7 @@ use std::{fs, path::{Path, PathBuf}, thread, time::Duration as StdDuration};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const MAX_SIGNAL_AGE_MIN: i64 = 20;
-const MAX_HOLD_MIN:        i64 = 60;
+// MAX_HOLD_MIN removed — replaced by per-coin max_hold_min(symbol) function
 const POLL_INTERVAL_SECS:  u64 = 60;
 const OKX_BASE: &str           = "https://www.okx.com";
 const MAX_OPEN_POSITIONS:  i64 = 3;   // max concurrent positions
@@ -41,6 +41,22 @@ fn coin_max_alloc(symbol: &str) -> f64 {
         "AVAXUSDT"| "NEARUSDT" | "UNIUSDT"  |
         "LINKUSDT"| "LTCUSDT"                        => 0.20, // established alts
         _                                            => 0.15, // high-beta (FIL, APT, SUI, ARB, OP, INJ…)
+    }
+}
+
+/// Per-coin time-stop (max hold duration in minutes).
+/// Large caps move slowly and need more time to develop a move.
+/// High-beta alts are fast and should be cut quickly if stalling.
+fn max_hold_min(symbol: &str) -> i64 {
+    match symbol {
+        // Large cap — slow, needs 2h to develop momentum
+        "BTCUSDT" | "ETHUSDT"                        => 120,
+        // Mid cap — moderate speed, 90 min is fair
+        "SOLUSDT" | "BNBUSDT" | "XRPUSDT"  |
+        "ADAUSDT" | "DOTUSDT" | "LINKUSDT"  |
+        "LTCUSDT" | "DOGEUSDT"                       => 90,
+        // High-beta / fast alts — keep tight at 60 min
+        _                                            => 60,
     }
 }
 
@@ -429,7 +445,7 @@ fn append_journal(base: &Path, block: &str) {
     println!("[executor] 📝 Journal updated");
 }
 
-fn journal_opened(base: &Path, sig: &Signal, fill: f64, usdt: f64, equity: f64, risk_frac: f64) {
+fn journal_opened(base: &Path, sig: &Signal, fill: f64, usdt: f64, equity: f64, risk_frac: f64, hold_min: i64) {
     let t   = Local::now().format("%H:%M").to_string();
     let ev  = sig.ev.map(|e| format!("{:+.2}R", e)).unwrap_or_else(|| "N/A".to_string());
     let tier = signal_tier(sig);
@@ -449,23 +465,63 @@ fn journal_opened(base: &Path, sig: &Signal, fill: f64, usdt: f64, equity: f64, 
         sig.stop, sig.tp1, usdt,
         risk_frac * 100.0, equity * risk_frac, equity, ev,
         sig.p_up.unwrap_or(0.5), sig.confidence.unwrap_or(0.0),
-        tier, risk_frac * 100.0, MAX_HOLD_MIN, ev);
+        tier, risk_frac * 100.0, hold_min, ev);
     append_journal(base, &block);
 }
 
 fn journal_closed(base: &Path, sig: &Signal, pnl: f64, status: &str, reason: &str) {
-    let t     = Local::now().format("%H:%M").to_string();
-    let emoji = if status == "CLOSED_TP" { "✅" } else if pnl >= 0.0 { "↩️" } else { "❌" };
-    let label = match status { "CLOSED_TP" => "TP HIT", "CLOSED_SL" => "STOP LOSS", _ => "TIME EXIT" };
-    let ll = if status == "CLOSED_TP" {
-        "1. TP1 hit — sistem bekerja.\n2. Profit diambil cepat, tidak tunggu reversal.\n\
-3. Catat kondisi volume & regime saat exit.\n4. Kelola bias: jangan over-trade setelah win."
-    } else if status == "CLOSED_SL" {
-        "1. SL terpicu — normal dalam probabilistic system.\n2. Cek: volume konfirmasi cukup kuat saat entry?\n\
-3. Loss dalam budget yang sudah dikunci (Kelly).\n4. 3 consecutive losses → circuit breaker aktif."
-    } else {
-        "1. Time exit: market tidak bergerak dalam 60 menit.\n2. Sideways/konsolidasi — skip next time.\n\
-3. Tanda regime kurang mendukung untuk momentum play.\n4. Evaluasi: ADX cukup tinggi saat entry?"
+    let t = Local::now().format("%H:%M").to_string();
+    let (emoji, label) = match status {
+        "CLOSED_TP"        => ("✅", "TP1 HIT — Partial Exit"),
+        "CLOSED_TP2"       => ("🎯", "TP2 HIT — Full Target"),
+        "CLOSED_TRAIL"     => ("🎯", "TRAILING STOP"),
+        "CLOSED_BREAKEVEN" => ("⚖️",  "BREAKEVEN EXIT"),
+        "CLOSED_SL"        => ("❌", "STOP LOSS"),
+        "CLOSED_TIME"      => ("⏰", "TIME EXIT"),
+        "CLOSED_MANUAL"    => ("🛑", "MANUAL CLOSE"),
+        _                  => ("↩️", "EXIT"),
+    };
+    let ll = match status {
+        "CLOSED_TP" =>
+            "1. TP1 hit — setengah posisi sudah exit, profit terkunci.\n\
+2. SL dipindah ke breakeven → worst case skenario selanjutnya = 0.\n\
+3. Trail stop aktif 2.5% dari high water — melindungi remaining profit.\n\
+4. Evaluasi: apakah momentum masih kuat untuk TP2?",
+        "CLOSED_TP2" =>
+            "1. TP2 hit — full target tercapai, sistem bekerja sempurna!\n\
+2. Two-stage exit terbukti efektif: TP1 lock profit → TP2 maximize gain.\n\
+3. Patience setelah TP1 terbayar — jangan terlalu cepat cut remaining position.\n\
+4. Catat kondisi: regime + EMA alignment + volume yang mendukung setup ini.",
+        "CLOSED_TRAIL" =>
+            "1. Trailing stop aktif setelah TP1 — profit terlindungi dari reversal.\n\
+2. Market reversal setelah high water mark — trail stop menghindari drawback lebih besar.\n\
+3. High water tracking strategy terbukti efektif untuk trend following.\n\
+4. Evaluasi: apakah TP2 level terlalu jauh atau timing momentum sudah habis?",
+        "CLOSED_BREAKEVEN" =>
+            "1. Posisi exit di breakeven setelah TP1 partial — tidak rugi, tidak profit maksimal.\n\
+2. SL dipindah ke entry setelah TP1 berhasil memproteksi modal.\n\
+3. Market gagal mencapai TP2 — momentum melemah setelah TP1.\n\
+4. Evaluasi: ADX trend strength dan regime saat entry — apakah sustainable?",
+        "CLOSED_SL" =>
+            "1. SL terpicu — normal dalam probabilistic trading system.\n\
+2. Cek kembali: apakah volume konfirmasi cukup kuat saat entry?\n\
+3. Loss dalam budget yang telah dikunci via Kelly sizing.\n\
+4. ≥3 consecutive losses → circuit breaker aktif, hentikan trading hari ini.",
+        "CLOSED_TIME" =>
+            "1. Time exit 60 menit — market tidak bergerak sesuai ekspektasi.\n\
+2. Sideways/konsolidasi — kondisi ini perlu dihindari di entry berikutnya.\n\
+3. Tanda regime kurang trending — cek ADX saat entry (minimal 20+).\n\
+4. Pertimbangkan: apakah EMA alignment dan volume cukup kuat di awal?",
+        "CLOSED_MANUAL" =>
+            "1. Manual close — di luar normal system flow.\n\
+2. Catat alasan intervensi dan kondisi market saat itu.\n\
+3. Evaluasi: apakah intervensi tepat atau sebaiknya biarkan sistem berjalan?\n\
+4. Jika ada systematic issue, update parameter di OPS_STATE.md.",
+        _ =>
+            "1. Exit tidak terduga — cek log executor untuk detail.\n\
+2. Validasi kondisi market dan parameter saat close.\n\
+3. Catat sebagai edge case untuk improvement algoritma.\n\
+4. Monitor sistem lebih ketat pada kondisi serupa.",
     };
     let block = format!("\n\
 ## Live Trade CLOSED ({}) — {} WIB {}\n\
@@ -588,6 +644,12 @@ fn get_daily_stats(conn: &Connection, today: &str, starting_equity: f64) -> (f64
     ).unwrap_or((0.0,0,0,false))
 }
 
+/// Pure circuit-breaker gate: returns true if it is safe to open new trades.
+/// Extracted for unit-testability — the main loop calls this with live values.
+fn is_risk_ok(cb_hit: bool, consec_losses: i64, drawdown: f64, max_losses: u32, max_dd: f64) -> bool {
+    !cb_hit && (consec_losses as u32) < max_losses && drawdown < max_dd
+}
+
 // ── Correlation check ────────────────────────────────────────────────────────
 fn corr_group_blocked(conn: &Connection, symbol: &str) -> bool {
     let group: Option<&[&str]> = if CORR_GROUP_1.contains(&symbol) { Some(CORR_GROUP_1) }
@@ -636,7 +698,7 @@ fn main() -> Result<()> {
         let (realized_pnl, consec_losses, _tc, cb_hit) = get_daily_stats(&live_conn, &today, equity);
 
         let drawdown = if equity > 0.0 { -realized_pnl / equity } else { 0.0 };
-        let risk_ok  = !cb_hit && (consec_losses as u32) < cb_losses && drawdown < max_dd;
+        let risk_ok  = is_risk_ok(cb_hit, consec_losses, drawdown, cb_losses, max_dd);
 
         // ── Process new signals ───────────────────────────────────────────────
         if risk_ok {
@@ -834,7 +896,7 @@ fn main() -> Result<()> {
                             live_conn.execute(
                                 "UPDATE daily_stats SET trade_count=trade_count+1 WHERE trade_date=?",
                                 params![today]).ok();
-                            journal_opened(&base, &sig, fill, usdt_spend, equity, risk_frac);
+                            journal_opened(&base, &sig, fill, usdt_spend, equity, risk_frac, max_hold_min(&sig.symbol));
                             mark_processed(&live_conn, sig_id, &sig.symbol, &sig.direction,
                                            sig.entry, actual_stop, actual_tp1, &order_id, "FILLED", fill,
                                            &format!("tier={} ev={:.2} risk={:.1}%",
@@ -935,7 +997,7 @@ fn main() -> Result<()> {
                 else { println!("[executor] ⚠️  Trail sell failed — retrying"); (false, 0.0, "", String::new()) }
 
             // ── Time exit ─────────────────────────────────────────────────────
-            } else if hold_min >= MAX_HOLD_MIN {
+            } else if hold_min >= max_hold_min(&symbol) {
                 cancel_pending_algos(&client, &cfg, &inst);
                 let p = (current - entry) * qty;
                 println!("[executor] ⏱️  Time exit {} {}min @ {:.4}", symbol, hold_min, current);
@@ -1891,5 +1953,108 @@ mod tests {
         let s = sig(0.5, 0.55, 0.45, 0.5, 79.0, 76.5, 81.0);
         let r = kelly_risk_fraction(&s, 0.0);
         assert!(r >= 0.01, "Kelly must never go below 1%: got {:.4}", r);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 22. MAX_HOLD_MIN — per-coin time-stop
+    // ════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn hold_btc_eth_120min() {
+        assert_eq!(max_hold_min("BTCUSDT"), 120);
+        assert_eq!(max_hold_min("ETHUSDT"), 120);
+    }
+
+    #[test]
+    fn hold_mid_caps_90min() {
+        for sym in &["SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","DOTUSDT","LINKUSDT","LTCUSDT","DOGEUSDT"] {
+            assert_eq!(max_hold_min(sym), 90, "{} should be 90min", sym);
+        }
+    }
+
+    #[test]
+    fn hold_highbeta_60min() {
+        for sym in &["AVAXUSDT","APTUSDT","SUIUSDT","FILUSDT","ARBUSDT","OPUSDT","INJUSDT","NEARUSDT","UNIUSDT"] {
+            assert_eq!(max_hold_min(sym), 60, "{} should be 60min", sym);
+        }
+    }
+
+    #[test]
+    fn hold_unknown_symbol_defaults_60min() {
+        assert_eq!(max_hold_min("UNKNOWNUSDT"), 60);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 23. CIRCUIT BREAKER — is_risk_ok pure function
+    // ════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn circuit_breaker_clean_state_is_ok() {
+        // No losses, no drawdown, cb_hit=false → safe to trade
+        assert!(is_risk_ok(false, 0, 0.0, 3, 0.10),
+            "Clean state must be risk_ok");
+    }
+
+    #[test]
+    fn circuit_breaker_cb_flag_blocks() {
+        // cb_hit=true regardless of other params → blocked
+        assert!(!is_risk_ok(true, 0, 0.0, 3, 0.10),
+            "cb_hit=true must block trading");
+    }
+
+    #[test]
+    fn circuit_breaker_exactly_max_losses_blocks() {
+        // consec_losses == max_losses → blocked (strict <)
+        assert!(!is_risk_ok(false, 3, 0.0, 3, 0.10),
+            "consec_losses=3 with max=3 must block");
+    }
+
+    #[test]
+    fn circuit_breaker_one_below_max_losses_ok() {
+        // consec_losses = max_losses - 1 → still safe
+        assert!(is_risk_ok(false, 2, 0.0, 3, 0.10),
+            "consec_losses=2 with max=3 must allow trading");
+    }
+
+    #[test]
+    fn circuit_breaker_over_max_losses_blocks() {
+        // consec_losses > max_losses → definitely blocked
+        assert!(!is_risk_ok(false, 5, 0.0, 3, 0.10),
+            "consec_losses=5 must block");
+    }
+
+    #[test]
+    fn circuit_breaker_drawdown_exactly_at_limit_blocks() {
+        // drawdown == max_dd → blocked (strict <)
+        assert!(!is_risk_ok(false, 0, 0.10, 3, 0.10),
+            "drawdown=10% at max=10% must block");
+    }
+
+    #[test]
+    fn circuit_breaker_drawdown_just_below_limit_ok() {
+        // drawdown = 9.9% < 10% max → allowed
+        assert!(is_risk_ok(false, 0, 0.099, 3, 0.10),
+            "drawdown=9.9% below 10% max must allow trading");
+    }
+
+    #[test]
+    fn circuit_breaker_drawdown_over_limit_blocks() {
+        // drawdown = 15% > 10% max → blocked
+        assert!(!is_risk_ok(false, 0, 0.15, 3, 0.10),
+            "drawdown=15% must block");
+    }
+
+    #[test]
+    fn circuit_breaker_combined_losses_and_drawdown() {
+        // Both consec_losses AND drawdown over limit → blocked
+        assert!(!is_risk_ok(false, 4, 0.12, 3, 0.10),
+            "Combined breach must block");
+    }
+
+    #[test]
+    fn circuit_breaker_zero_max_losses_always_blocks() {
+        // max_losses=0: any loss (even 0 consec) → blocked since 0 < 0 is false
+        assert!(!is_risk_ok(false, 0, 0.0, 0, 0.10),
+            "max_losses=0 means never trade (blocked even at 0 losses)");
     }
 }
