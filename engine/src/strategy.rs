@@ -106,6 +106,19 @@ pub fn evaluate(
     // Volume threshold: computed from research-backed pure function
     let min_volume = volume_gate_threshold(&config.preset, &regime);
 
+    // ── HMTF / AMS integration ──────────────────────────────────────────────
+    // Use AMS tier when available (not C), else fall back to HMTF tier
+    let effective_tier = if best.ams_tier != 'C' { best.ams_tier } else { best.hmtf_tier };
+    let hmtf_active = best.hmtf_entry_score != 0.0 || best.ams_tier != 'C';
+    let hmtf_gate_ok = !hmtf_active || effective_tier != 'C';
+    let hmtf_gate_val = match effective_tier {
+        'A' => 0.8,
+        'B' => 0.5,
+        'R' => 0.6, // reversion trades pass gate
+        _ => 0.1,
+    };
+    let _ = hmtf_gate_val;
+
     let pass_regime = regime != Regime::RiskOff; // block crash in both modes
 
     let pass_score = if speculative_avax_mode {
@@ -142,14 +155,15 @@ pub fn evaluate(
         pass_adx,
         pass_confidence,
         pass_probability,
+        hmtf_gate_ok,
     ]
     .iter()
     .filter(|&&x| x)
     .count();
     let setup_grade = match checklist_pass_count {
-        6 => "A",
-        5 => "B",
-        4 => "C",
+        7 => "A",
+        6 => "B",
+        5 => "C",
         _ => "D",
     };
 
@@ -191,10 +205,20 @@ pub fn evaluate(
             prob.confidence,
             prob.expected_value_r
         ),
+        format!(
+            "HMTF/AMS gate (tier!=C): {} (ams={}, hmtf={}, E={:.4}, align={}, ρ={:.2}, div={:.3})",
+            mark(hmtf_gate_ok),
+            effective_tier,
+            best.hmtf_tier,
+            best.hmtf_entry_score,
+            best.hmtf_alignment,
+            best.ams_regime_rho,
+            best.ams_divergence_d,
+        ),
     ];
 
     let quality_gate = format!(
-        "gate(grade={},regime={},score={},volume={},adx={},confidence={},prob={});bayes(prior={:.2},tech={:.2},news={:.2},post={:.2})",
+        "gate(grade={},regime={},score={},volume={},adx={},confidence={},prob={});bayes(prior={:.2},tech={:.2},news={:.2},post={:.2});ams={},ams_regime={:.2},ams_div={:.3}",
         setup_grade,
         pass_regime,
         pass_score,
@@ -205,16 +229,20 @@ pub fn evaluate(
         prob.prior_up,
         prob.tech_likelihood,
         prob.news_likelihood,
-        prob.posterior_up
+        prob.posterior_up,
+        effective_tier,
+        best.ams_regime_rho,
+        best.ams_divergence_d,
     );
 
-    // All 6 gates must pass — no bypass. Aggressive mode already has looser thresholds.
+    // All 7 gates must pass — no bypass. Aggressive mode already has looser thresholds.
     let full_gate_pass = pass_regime
         && pass_score
         && pass_volume
         && pass_adx
         && pass_confidence
-        && pass_probability;
+        && pass_probability
+        && hmtf_gate_ok;
 
     if !full_gate_pass {
         return no_trade(
@@ -236,14 +264,20 @@ pub fn evaluate(
     // Spot-only / halal constraint: NEVER short. Long only.
     let direction = Direction::Long;
 
-    let risk_pct = if speculative_avax_mode {
-        // Experimental paper-only mode: run at full configured risk cap.
+    let base_risk = if speculative_avax_mode {
         config.max_risk_per_trade_pct
     } else {
         risk::adjusted_risk_pct(config, regime, confidence_label)
     };
+    // Apply AMS kelly multiplier for reversion trades
+    let risk_pct = if effective_tier == 'R' && best.ams_kelly_multiplier > 0.0 {
+        base_risk * best.ams_kelly_multiplier
+    } else {
+        base_risk
+    };
     let atr_value = best.price * (best.atr14_pct / 100.0);
-    let expected_r = 2.0; // TP2 as baseline
+    // Tier R: more conservative EV (win_rate=0.45, reward=1.2R)
+    let expected_r = if effective_tier == 'R' { 1.2 } else { 2.0 };
     if expected_r < config.min_expected_r {
         return no_trade(
             hour_label,
@@ -297,7 +331,7 @@ pub fn evaluate(
             tp2,
             risk_pct,
             rationale: format!(
-                "{} {} passed quality gate [{}]. score={}, vol={:.2}x, adx={:.1}, p_up={:.2}, p_down={:.2}, conf={:.2}, ev={:+.2}R, risk={:.1}%, expected_r={:.1}.",
+                "{} {} passed quality gate [{}]. score={}, vol={:.2}x, adx={:.1}, p_up={:.2}, p_down={:.2}, conf={:.2}, ev={:+.2}R, risk={:.1}%, expected_r={:.1}. HMTF: tier={}, E={:.4}, align={}. AMS: ams={}, ρ={:.2}, div={:.3}, kelly={:.2}.",
                 best.symbol,
                 direction,
                 setup_grade,
@@ -309,7 +343,14 @@ pub fn evaluate(
                 prob.confidence,
                 prob.expected_value_r,
                 risk_pct,
-                expected_r
+                expected_r,
+                best.hmtf_tier,
+                best.hmtf_entry_score,
+                best.hmtf_alignment,
+                effective_tier,
+                best.ams_regime_rho,
+                best.ams_divergence_d,
+                best.ams_kelly_multiplier,
             ),
         },
     }

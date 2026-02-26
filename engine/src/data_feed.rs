@@ -41,6 +41,7 @@ pub fn parse_realtime_cache(
             let atr14_pct = if s.atr14_pct > 0.0 { s.atr14_pct } else { 1.0 };
             let adx14 = if s.adx14 > 0.0 { s.adx14 } else { 20.0 };
 
+            let ams_tier_char = if s.hmtf_tier != 'C' { s.hmtf_tier } else { 'C' };
             let mut coin = CoinData {
                 symbol: s.symbol.clone(),
                 grade: 'C',
@@ -57,6 +58,16 @@ pub fn parse_realtime_cache(
                 range_pos_7d: 50.0,
                 volume_ratio: sanitize::volume_ratio(s.volume_ratio),
                 regime: "Realtime".to_string(),
+                hmtf_entry_score: s.hmtf_entry_score,
+                hmtf_alignment: s.hmtf_alignment,
+                hmtf_tier: s.hmtf_tier,
+                ams_regime_rho: s.ams_regime_rho,
+                ams_regime_label: if s.ams_regime_label.is_empty() { "UNKNOWN".to_string() } else { s.ams_regime_label.clone() },
+                ams_divergence_d: s.ams_divergence_d,
+                ams_e_trend: s.ams_e_trend,
+                ams_e_reversion: s.ams_e_reversion,
+                ams_tier: ams_tier_char,
+                ams_kelly_multiplier: s.ams_kelly_multiplier,
             };
             coin.score = sanitize::score(indicators::compute_score(&coin));
             coin.grade = indicators::grade_from_score(coin.score);
@@ -249,6 +260,16 @@ fn parse_scan_content(content: &str) -> Result<MarketSnapshot, String> {
                 range_pos_7d: range_pos.clamp(0.0, 100.0),
                 volume_ratio: sanitize::volume_ratio(vol_ratio),
                 regime: coin_regime,
+                hmtf_entry_score: 0.0,
+                hmtf_alignment: 0,
+                hmtf_tier: 'C',
+                ams_regime_rho: 0.0,
+                ams_regime_label: "UNKNOWN".to_string(),
+                ams_divergence_d: 0.0,
+                ams_e_trend: 0.0,
+                ams_e_reversion: 0.0,
+                ams_tier: 'C',
+                ams_kelly_multiplier: 0.0,
             });
         }
         i += 1;

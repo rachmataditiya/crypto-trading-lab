@@ -18,6 +18,17 @@ pub struct CoinData {
     pub range_pos_7d: f64,
     pub volume_ratio: f64,
     pub regime: String,
+    pub hmtf_entry_score: f64,
+    pub hmtf_alignment: u8,
+    pub hmtf_tier: char,
+    // ── AMS fields ──
+    pub ams_regime_rho: f64,
+    pub ams_regime_label: String,
+    pub ams_divergence_d: f64,
+    pub ams_e_trend: f64,
+    pub ams_e_reversion: f64,
+    pub ams_tier: char,
+    pub ams_kelly_multiplier: f64,
 }
 
 /// Market-level summary from the scan file.

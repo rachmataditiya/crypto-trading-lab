@@ -1,4 +1,5 @@
 use crate::config::RealtimeConfig;
+use crate::hmtf;
 use crate::sanitize;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chrono::Utc;
@@ -24,6 +25,8 @@ const REST_BASE: &str = "https://www.okx.com";
 const MAX_1M: usize = 120; // 2h of 1m closes
 const MAX_1H: usize = 120; // 5d of H1 closes
 const MAX_4H: usize = 120; // 20d of H4 closes
+const MAX_8H: usize = 60;  // ~15d of H6 closes (OKX has no 8H; using 6H)
+const MAX_12H: usize = 60; // ~30d of H12 closes
 const MAX_1D: usize = 100; // 100d of D1 closes
 
 // ── Credentials ────────────────────────────────────────────────────────────
@@ -84,6 +87,30 @@ pub struct SymbolState {
     /// Indicates which timeframe is driving the indicators
     pub indicator_tf: String,
 
+    // ── HMTF fields (serialised to cache) ──
+    #[serde(default)]
+    pub hmtf_entry_score: f64,
+    #[serde(default)]
+    pub hmtf_alignment: u8,
+    #[serde(default = "default_hmtf_tier")]
+    pub hmtf_tier: char,
+    #[serde(default)]
+    pub hmtf_gate: f64,
+
+    // ── AMS fields (serialised to cache) ──
+    #[serde(default)]
+    pub ams_regime_rho: f64,
+    #[serde(default = "default_ams_regime_label")]
+    pub ams_regime_label: String,
+    #[serde(default)]
+    pub ams_divergence_d: f64,
+    #[serde(default)]
+    pub ams_e_trend: f64,
+    #[serde(default)]
+    pub ams_e_reversion: f64,
+    #[serde(default)]
+    pub ams_kelly_multiplier: f64,
+
     // ── close-price history (not serialised, rebuilt from WS / REST seed) ──
     #[serde(skip)]
     closes:     VecDeque<f64>, // 1m confirmed closes
@@ -92,7 +119,19 @@ pub struct SymbolState {
     #[serde(skip)]
     closes_4h:  VecDeque<f64>, // H4 confirmed closes
     #[serde(skip)]
+    closes_8h:  VecDeque<f64>, // H6 confirmed closes (OKX has no 8H, using 6H)
+    #[serde(skip)]
+    closes_12h: VecDeque<f64>, // H12 confirmed closes
+    #[serde(skip)]
     closes_1d:  VecDeque<f64>, // D1 confirmed closes
+}
+
+fn default_hmtf_tier() -> char {
+    'C'
+}
+
+fn default_ams_regime_label() -> String {
+    "UNKNOWN".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -126,7 +165,7 @@ pub fn run_daemon(workspace: &Path, cfg: &RealtimeConfig) -> Result<(), String> 
     let mut backoff_secs = 1u64;
 
     // Seed historical candle data via REST before WS connects
-    eprintln!("[REALTIME] seeding H1/H4/D1 candle history via REST...");
+    eprintln!("[REALTIME] seeding H1/H4/H8/H12/D1 candle history via REST...");
     let _ = rest_poll_once(workspace, cfg, &mut cache);
     eprintln!(
         "[REALTIME] REST seed done — symbols with price: {}",
@@ -241,6 +280,8 @@ fn run_ws_dual_session(
                 serde_json::json!({"channel":"candle1m","instId":inst}),
                 serde_json::json!({"channel":"candle1H","instId":inst}),
                 serde_json::json!({"channel":"candle4H","instId":inst}),
+                serde_json::json!({"channel":"candle6H","instId":inst}),
+                serde_json::json!({"channel":"candle12H","instId":inst}),
                 serde_json::json!({"channel":"candle1D","instId":inst}),
             ]
         })
@@ -256,8 +297,8 @@ fn run_ws_dual_session(
         thread::sleep(Duration::from_millis(400));
     }
     eprintln!(
-        "[REALTIME] candle WS subscribed ({} channels: 1m+1H+4H+1D × {} symbols)",
-        cfg.symbols.len() * 4,
+        "[REALTIME] candle WS subscribed ({} channels: 1m+1H+4H+6H+12H+1D × {} symbols)",
+        cfg.symbols.len() * 6,
         cfg.symbols.len()
     );
 
@@ -413,6 +454,18 @@ fn apply_ws_message(txt: &str, cache: &mut RealtimeCache) {
                 recompute_indicators(state);
             }
         }
+        "candle6H" => {
+            if let Some(close) = confirmed_close(arr) {
+                push_close(&mut state.closes_8h, close, MAX_8H);
+                recompute_indicators(state);
+            }
+        }
+        "candle12H" => {
+            if let Some(close) = confirmed_close(arr) {
+                push_close(&mut state.closes_12h, close, MAX_12H);
+                recompute_indicators(state);
+            }
+        }
         "candle1D" => {
             if let Some(close) = confirmed_close(arr) {
                 push_close(&mut state.closes_1d, close, MAX_1D);
@@ -494,6 +547,35 @@ fn recompute_indicators(state: &mut SymbolState) {
     // Multi-day returns (rough approximation from 24h ret)
     state.ret_3d = sanitize::ret_pct(state.ret_24h * 1.8);
     state.ret_7d = sanitize::ret_pct(state.ret_24h * 3.0);
+
+    // ── HMTF computation ──────────────────────────────────────────────────
+    if state.closes_1h.len() >= 15
+        && state.closes_4h.len() >= 15
+        && state.closes_8h.len() >= 15
+        && state.closes_12h.len() >= 15
+    {
+        let input = hmtf::HmtfInput {
+            closes_1h:  state.closes_1h.iter().copied().collect(),
+            closes_4h:  state.closes_4h.iter().copied().collect(),
+            closes_6h:  state.closes_8h.iter().copied().collect(),
+            closes_12h: state.closes_12h.iter().copied().collect(),
+            volume_ratio: state.volume_ratio,
+            price: state.price,
+            atr_pct: state.atr14_pct,
+        };
+        let sig = hmtf::compute_hmtf(&input);
+        state.hmtf_entry_score = sig.entry_score;
+        state.hmtf_alignment   = sig.alignment;
+        state.hmtf_tier        = sig.tier;
+        state.hmtf_gate        = sig.gate_product;
+        // AMS fields
+        state.ams_regime_rho       = sig.regime_rho;
+        state.ams_regime_label     = sig.regime_label.clone();
+        state.ams_divergence_d     = sig.divergence_d;
+        state.ams_e_trend          = sig.e_trend;
+        state.ams_e_reversion      = sig.e_reversion;
+        state.ams_kelly_multiplier = sig.kelly_multiplier;
+    }
 }
 
 fn compute_rsi14(v: &[f64]) -> f64 {
@@ -639,6 +721,12 @@ fn fetch_symbol_rest(
 
     // ── Seed H4 closes (120 candles ≈ 20 days) ─────────────────────────────
     fetch_candles_into(client, &inst, "4H",  120, &mut state.closes_4h)?;
+
+    // ── Seed H8 closes (60 candles ≈ 20 days) ──────────────────────────────
+    fetch_candles_into(client, &inst, "6H",  60, &mut state.closes_8h)?;
+
+    // ── Seed H12 closes (60 candles ≈ 30 days) ─────────────────────────────
+    fetch_candles_into(client, &inst, "12H", 60, &mut state.closes_12h)?;
 
     // ── Seed D1 closes (100 candles ≈ 3 months) ────────────────────────────
     fetch_candles_into(client, &inst, "1D",  100, &mut state.closes_1d)?;

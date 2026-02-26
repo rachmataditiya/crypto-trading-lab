@@ -125,6 +125,16 @@ mod tests {
             ret_7d: 6.0,
             range_pos_7d: 0.7,
             regime: "trending".to_string(),
+            hmtf_entry_score: 0.0,
+            hmtf_alignment: 0,
+            hmtf_tier: 'C',
+            ams_regime_rho: 0.0,
+            ams_regime_label: "UNKNOWN".to_string(),
+            ams_divergence_d: 0.0,
+            ams_e_trend: 0.0,
+            ams_e_reversion: 0.0,
+            ams_tier: 'C',
+            ams_kelly_multiplier: 0.0,
         }
     }
 
