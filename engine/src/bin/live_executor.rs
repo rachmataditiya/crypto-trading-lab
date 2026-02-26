@@ -589,6 +589,7 @@ fn init_live_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN half_exited INTEGER DEFAULT 0", params![]);
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN p_up REAL", params![]);
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN high_water REAL DEFAULT 0", params![]);
+    let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN closed_at TEXT", params![]);
     Ok(())
 }
 
@@ -625,7 +626,7 @@ fn cooldown_active(conn: &Connection, symbol: &str, cooldown_min: i64) -> bool {
         .to_rfc3339();
     conn.query_row(
         "SELECT 1 FROM open_positions
-         WHERE symbol=? AND status != 'OPEN' AND opened_at >= ?",
+         WHERE symbol=? AND status != 'OPEN' AND closed_at >= ?",
         params![symbol, cutoff],
         |_| Ok(true)
     ).unwrap_or(false)
@@ -1034,7 +1035,8 @@ fn main() -> Result<()> {
             } else { (false, 0.0, "", String::new()) };
 
             if closed {
-                live_conn.execute("UPDATE open_positions SET status=? WHERE id=?", params![status,pid]).ok();
+                let closed_now = chrono::Utc::now().to_rfc3339();
+                live_conn.execute("UPDATE open_positions SET status=?, closed_at=? WHERE id=?", params![status,closed_now,pid]).ok();
                 live_conn.execute("UPDATE processed_signals SET status=?,pnl_usdt=? WHERE signal_id=?",
                     params![status,pnl,sig_id]).ok();
                 let is_loss: i64 = if pnl < 0.0 { 1 } else { 0 };
@@ -1677,7 +1679,8 @@ mod tests {
                 risk_usdt REAL, opened_at TEXT,
                 status TEXT DEFAULT 'OPEN',
                 half_exited INTEGER DEFAULT 0,
-                p_up REAL, high_water REAL DEFAULT 0
+                p_up REAL, high_water REAL DEFAULT 0,
+                closed_at TEXT
              );"
         ).unwrap();
         conn
@@ -1784,13 +1787,13 @@ mod tests {
     #[test]
     fn cooldown_blocks_recent_close() {
         let conn = make_test_db();
-        // Insert a recently-closed SOL position (opened 5 min ago, now closed)
+        // Insert a recently-closed SOL position (closed 5 min ago)
         let recent = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
         conn.execute(
             "INSERT INTO open_positions
              (symbol, direction, qty, entry_price, stop_price, tp1_price, tp2_price,
-              risk_usdt, opened_at, status)
-             VALUES ('SOLUSDT','Long',1.0,80.0,77.0,83.0,86.0,2.0,?1,'CLOSED_TP2')",
+              risk_usdt, opened_at, closed_at, status)
+             VALUES ('SOLUSDT','Long',1.0,80.0,77.0,83.0,86.0,2.0,'2026-01-01T00:00:00Z',?1,'CLOSED_TP2')",
             rusqlite::params![recent],
         ).unwrap();
         assert!(cooldown_active(&conn, "SOLUSDT", 30),
@@ -1805,8 +1808,8 @@ mod tests {
         conn.execute(
             "INSERT INTO open_positions
              (symbol, direction, qty, entry_price, stop_price, tp1_price, tp2_price,
-              risk_usdt, opened_at, status)
-             VALUES ('SOLUSDT','Long',1.0,80.0,77.0,83.0,86.0,2.0,?1,'CLOSED_TP2')",
+              risk_usdt, opened_at, closed_at, status)
+             VALUES ('SOLUSDT','Long',1.0,80.0,77.0,83.0,86.0,2.0,'2026-01-01T00:00:00Z',?1,'CLOSED_TP2')",
             rusqlite::params![old],
         ).unwrap();
         assert!(!cooldown_active(&conn, "SOLUSDT", 30),
