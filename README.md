@@ -1,6 +1,6 @@
 # 🤖 Crypto Trading Lab
 
-> Autonomous spot trading system — Rust-powered, OKX-connected, halal (spot long-only).
+> Autonomous live spot trading system — Rust-powered, OKX-connected, halal (spot long-only).
 
 Private repository. Personal use only.
 
@@ -9,131 +9,186 @@ Private repository. Personal use only.
 ## 📋 Overview
 
 A fully automated crypto trading system built from scratch with:
-- **Real-time market data** via OKX public WebSocket + REST API
-- **Bayesian signal evaluation** with multi-gate quality filters
-- **Live order execution** on OKX spot market (no futures, no leverage)
-- **Software stop-loss** with 60s polling (OKX acctLv=1 limitation)
-- **Daily reporting** via WhatsApp (OpenClaw integration)
+- **Dual WebSocket real-time data** — OKX public WS (ticker/orderbook) + business WS (candles, HMAC auth)
+- **H4 indicator engine** — RSI14, EMA20/50, ATR14, ADX14 from 4H confirmed candles for 19 coins
+- **Bayesian signal evaluation** — multi-gate quality filters with probabilistic EV scoring
+- **Live order execution** — OKX spot market orders, Kelly sizing, software SL/TP
+- **Multi-position management** — up to 3 concurrent, correlation-aware
+- **Daily reporting** — WhatsApp summary via OpenClaw at 17:00 WIB
 
-**Halal constraint enforced:** spot long-only, no shorts, no leverage, no derivatives.
+**Halal constraint enforced:** spot long-only, no shorts, no leverage, no derivatives, no riba.
 
 ---
 
 ## 🏗️ Architecture
 
 ```
+OKX REST + WebSocket API
+          │
+          ▼
 ┌─────────────────────────────────────────────────────────┐
-│                    macOS LaunchAgents                    │
-│                                                         │
-│  ┌──────────────────┐    ┌──────────────────────────┐   │
-│  │  realtime-engine │    │      sim-engine          │   │
-│  │  (KeepAlive)     │    │  (StartInterval: 300s)   │   │
-│  │                  │    │                          │   │
-│  │  OKX REST/WS     │───▶│  strategy.rs             │   │
-│  │  20s poll        │    │  indicators.rs           │   │
-│  │  RSI14, ATR14    │    │  regime.rs               │   │
-│  │  ADX14, EMA20/50 │    │  risk.rs                 │   │
-│  └────────┬─────────┘    └────────────┬─────────────┘   │
-│           │                           │                  │
-│           ▼                           ▼                  │
-│    realtime_cache.json          sim_history.db           │
-│                                       │                  │
-│                          ┌────────────▼─────────────┐   │
-│                          │     live-executor         │   │
-│                          │     (KeepAlive)           │   │
-│                          │                          │   │
-│                          │  60s poll                │   │
-│                          │  Kelly sizing            │   │
-│                          │  OKX market orders       │   │
-│                          │  Software SL/TP          │   │
-│                          └────────────┬─────────────┘   │
-│                                       │                  │
-│                                       ▼                  │
-│                               live_positions.db          │
-└─────────────────────────────────────────────────────────┘
-                                        │
-                                        ▼
-                          OKX Spot Account (acctLv=1)
+│  realtime-engine (KeepAlive)                            │
+│  ├── Public WS:   ticker + books5 (19 coins, 38 ch)    │
+│  ├── Business WS: candle1m/1H/4H/1D (76 ch, HMAC auth)│
+│  ├── REST seed:   120×H1, 120×H4, 100×D1 at startup   │
+│  └── Output:      realtime_cache.json (≤1 write/sec)   │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  sim-engine (every 300s)                                │
+│  ├── Reads realtime_cache.json                         │
+│  ├── 6-gate quality filter (regime/score/vol/adx/conf) │
+│  ├── Bayesian EV scoring + signal tier (A/B/C)         │
+│  └── Output: sim_history.db (PAPER_TRADE / NO_TRADE)   │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  live-executor (every 60s, KeepAlive)                   │
+│  ├── Reads PAPER_TRADE signals (last 20 min, by EV)    │
+│  ├── Gates: corr group, cooldown, circuit breaker      │
+│  ├── Kelly sizing → OKX market buy                     │
+│  ├── Post-fill: query actual qty, place SL algo        │
+│  ├── Position monitor loop:                            │
+│  │   ├── TP2   → cancel algos → full market sell       │
+│  │   ├── Trail → 2.5% from high_water (after TP1)     │
+│  │   ├── TP1   → 50% sell, SL moved to breakeven      │
+│  │   ├── Time  → BTC/ETH 120min, mid 90min, alts 60min│
+│  │   └── SL    → software backup (algo = crash guard)  │
+│  └── Output: live_positions.db                         │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+                OKX Spot Account (acctLv=1)
 ```
 
 ---
 
-## 🧠 Signal Generation Logic
+## 🪙 Coin Universe (19 coins)
 
-### Quality Gate (6-gate system)
-All 6 gates must pass before a signal becomes a trade:
+**Top 8 (main scanner):**
+`BTCUSDT` `ETHUSDT` `SOLUSDT` `BNBUSDT` `ADAUSDT` `DOGEUSDT` `XRPUSDT` `DOTUSDT`
 
-| Gate | Aggressive Mode | Normal Mode |
-|------|----------------|-------------|
-| **Regime** | Not RiskOff | Not RiskOff |
-| **Score** | `price > EMA20 > EMA50` | `score >= min_score` |
-| **Volume** | `>= 2.0x` (RiskOn) / `2.2x` (Mixed) / `2.5x` (RiskOff) | `>= 1.5x` (+0.2/+0.5 by regime) |
-| **ADX** | `>= 20.0` (Wilder trending standard) | `>= min_adx` |
-| **Confidence** | Skip (EMA+vol sufficient) | Not "weak" |
-| **Prob/EV** | `>= 0.5R` | `conf >= 0.55 && EV > 0` |
+**Extended 11:**
+`AVAXUSDT` `APTUSDT` `SUIUSDT` `FILUSDT` `UNIUSDT` `LINKUSDT` `NEARUSDT` `ARBUSDT` `OPUSDT` `INJUSDT` `LTCUSDT`
 
-### Volume Tier Classification
-Research-backed thresholds (Kamps & Kleinberg 2018, empirical OKX data):
-
+**Correlation groups** (max 1 open per group simultaneously):
 ```
-WEAK    < 1.0x  — no conviction, skip
-NORMAL  1.0–2.0x — baseline activity
-EARLY   2.0–4.0x — early accumulation, valid entry zone
-IMPULSE 4.0–8.0x — ideal: early pump confirmed ← target zone
-SURGE   > 8.0x  — late-stage, chase risk high
+Group 1: BTC, ETH
+Group 2: SOL, BNB, ADA
+Group 3: AVAX, APT, ARB, OP, NEAR
+Group 4: DOGE, LTC
 ```
+
+---
+
+## 🧠 Signal Generation
+
+### 6-Gate Quality Filter
+All gates must pass for a signal to become a trade:
+
+| Gate | Condition |
+|------|-----------|
+| **Regime** | Market not Risk-off |
+| **Score** | `price > EMA20 > EMA50` (momentum mode) |
+| **Volume** | `≥ 2.0x` baseline (aggressive), tier EARLY–IMPULSE |
+| **ADX** | `≥ 20.0` (Wilder trending threshold) |
+| **Confidence** | Not "weak" (Bayesian posterior ≥ threshold) |
+| **Prob/EV** | `p_up ≥ 0.5`, `EV ≥ 0.5R` |
 
 ### Bayesian Probability Model
-```rust
-feature_score = 0.22*trend + 0.16*ema_stack + 0.16*momentum
-              + 0.20*vol   + 0.12*adx       - 0.08*rsi
-              + 0.06*news_sentiment
+```
+feature = 0.22×trend + 0.16×ema_stack + 0.16×momentum
+        + 0.20×volume + 0.12×adx − 0.08×rsi + 0.06×news
 
-posterior = bayesian_update(prior, tech_likelihood, news_likelihood)
-EV = p_up * 2.0R - p_down * 1.0R
+posterior = bayesian_update(prior=0.62, tech_lh, news_lh)
+EV = p_up × 2.0R − p_down × 1.0R
 ```
 
-Volume weight (0.20) is highest individual component — *volume leads price in crypto*.
+### Volume Tiers
+```
+WEAK     < 1.0x  — no conviction, skip
+NORMAL   1.0–2.0x — baseline
+EARLY    2.0–4.0x — accumulation, valid entry zone
+IMPULSE  4.0–8.0x — ideal target zone ← target
+SURGE    > 8.0x  — late-stage, chase risk
+```
+
+### Stale Signal Handling
+When price moves between signal generation and execution:
+```
+< −3%   from entry → DUMPED   (skip, invalidated)
+−3% to +3%         → NORMAL   (execute as-is)
++3% to +10%        → DYNAMIC  (recalculate SL/TP from fill)
+> +10%  from entry → CHASING  (skip, too late)
+```
 
 ---
 
 ## ⚖️ Risk Management
 
-### Fractional Kelly Sizing
+### Fractional Kelly Sizing (25% Kelly)
 ```
-Tier A  (EV >= 1.5R, conf >= 0.7) → 3–4% risk
-Tier B  (EV >= 0.8R, conf >= 0.4) → 1.5–2.5% risk
-Tier C  (EV < 0.5R  OR conf < 0.15) → SKIP
+Tier A  (EV ≥ 1.5R, conf ≥ 0.7)  → 3–4% per trade
+Tier B  (EV ≥ 0.8R, conf ≥ 0.4)  → 1.5–2.5% per trade
+Tier C  (EV < 0.5R or conf < 0.15) → SKIP
 ```
 
 ### Portfolio Rules
-- **Max open positions**: 1 (conservative start)
-- **Daily kill-switch**: -3R cumulative loss → halt all trading
-- **Max capital**: 100 USDT deployed at any time
-- **Correlation groups**: BTC+ETH max 1 simultaneously, SOL+BNB max 1
-- **Max hold**: 60 minutes per position (auto time-exit)
+| Rule | Value |
+|------|-------|
+| Max open positions | 3 concurrent |
+| Max portfolio risk | 6% total deployed |
+| Daily kill-switch | −10% drawdown → halt |
+| Circuit breaker | ≥3 consecutive losses → halt |
+| Cooldown per coin | 30 min after close |
+| Per-coin max alloc | BTC/ETH 40%, mid 25%, alts 20%, high-beta 15% |
 
-### Stop-Loss Mechanism
-OKX acctLv=1 does not support algo/conditional orders. SL is implemented in software:
-- Poll every 60 seconds
-- If `live_price <= stop_price` → market sell immediately
-- `market_sell()` returns `bool` — DB only updated on confirmed OKX success
-- Partial TP: 50% exit at TP1, trail SL to breakeven
+### Per-Coin Time-Stop
+Large caps move slowly and need more time to develop a move:
+```
+BTC, ETH                              → 120 minutes
+SOL, BNB, XRP, ADA, DOT, LINK, LTC, DOGE → 90 minutes
+AVAX, APT, SUI, FIL, UNI, NEAR, ARB, OP, INJ → 60 minutes
+```
+
+### Exit Priority (position monitor loop)
+```
+1. TP2        → full exit at target
+2. Trail stop → 2.5% from high_water, only after TP1, only if > entry
+3. TP1        → 50% exit, SL moved to breakeven
+4. Time stop  → per-coin limit above
+5. SL soft    → software backup if algo SL fails
+```
+
+### Pump & Dump Filter
+Blocks entry when:
+- `volume_ratio > 4.0 AND RSI > 78` (volume-driven pump, overbought)
+- `price > EMA20 × 1.08` (price stretched >8% above EMA20)
 
 ---
 
-## 📊 Stale Signal Detection
+## 📊 Signal Status Codes
 
-When price moves before execution:
-
-```
-< -3%  from signal entry → DUMPED   (invalidated, skip)
--3%–+3%                  → NORMAL   (execute as planned)
-+3%–+10%                 → DYNAMIC  (recalculate SL/TP from fill)
-> +10% from signal entry → CHASING  (late, skip)
-```
-
-For DYNAMIC entries: SL/TP are recalculated preserving original ATR% and TP% ratios from fill price.
+| Code | Meaning |
+|------|---------|
+| `FILLED` | Buy order executed, position open |
+| `CLOSED_TP` | TP1 partial exit (50%), SL moved to breakeven |
+| `CLOSED_TP2` | Full exit at TP2 target |
+| `CLOSED_TRAIL` | Trailing stop triggered (2.5% from high_water) |
+| `CLOSED_BREAKEVEN` | Breakeven SL triggered after TP1 |
+| `CLOSED_TIME` | Per-coin time-stop reached |
+| `CLOSED_SL` | Stop-loss triggered |
+| `CLOSED_MANUAL` | Manual intervention |
+| `SKIPPED_STALE` | Price dumped/chasing before execution |
+| `SKIPPED_CORR` | Correlation group already occupied |
+| `SKIPPED_COOLDOWN` | 30-min cooldown after same-coin close |
+| `SKIPPED_MAXPOS` | Already at 3 open positions |
+| `SKIPPED_DUPE` | Same symbol already open |
+| `SKIPPED_PUMP_DUMP` | Pump/exhaustion pattern detected |
+| `SKIPPED_TIER_C` | Signal EV/confidence too weak |
+| `SKIPPED_BALANCE` | Insufficient USDT balance |
 
 ---
 
@@ -141,27 +196,26 @@ For DYNAMIC entries: SL/TP are recalculated preserving original ATR% and TP% rat
 
 ```
 crypto-trading-lab/
-├── engine/                        # Rust workspace
-│   ├── src/
-│   │   ├── bin/
-│   │   │   └── live_executor.rs   # OKX live order execution
-│   │   ├── strategy.rs            # Signal evaluation + quality gates
-│   │   ├── indicators.rs          # RSI, ADX, EMA, volume scoring
-│   │   ├── realtime.rs            # OKX REST polling + WS daemon
-│   │   ├── regime.rs              # Market regime detection (RiskOn/Mixed/RiskOff)
-│   │   ├── risk.rs                # Kelly sizing + tier classification
-│   │   ├── models.rs              # Data types
-│   │   ├── config.rs              # Config structs
-│   │   └── data_feed.rs           # Scan file parser
-│   └── Cargo.toml
+├── engine/
+│   └── src/
+│       ├── bin/
+│       │   └── live_executor.rs   # OKX live order execution + position monitor
+│       ├── strategy.rs            # Signal evaluation + 6-gate quality filter
+│       ├── indicators.rs          # RSI, ADX, EMA, ATR, volume scoring
+│       ├── realtime.rs            # Dual WS daemon + H4 indicator engine
+│       ├── regime.rs              # Market regime detection (RiskOn/Mixed/RiskOff)
+│       ├── risk.rs                # Kelly sizing + tier classification
+│       ├── models.rs              # Data types
+│       ├── config.rs              # Config structs
+│       └── data_feed.rs           # Scan file parser
 ├── scripts/
 │   ├── okx_monitor.sh             # Real-time OKX balance + position monitor
 │   ├── balance_snapshot.sh        # Daily opening balance snapshot
 │   ├── self_heal.sh               # Process watchdog
-│   ├── alert_guard.sh             # Signal alert via OpenClaw
-│   ├── journal_write.sh           # Daily journal writer
-│   ├── sim_engine_daemon.sh       # Sim-engine launcher (every 5 min)
-│   └── realtime_daemon.sh         # Realtime-engine launcher (KeepAlive)
+│   └── alert_guard.sh             # Signal alert via OpenClaw
+├── references/                    # Trading playbook, scoring guide
+├── SKILL.md                       # OpenClaw skill definition
+├── OPS_STATE.md                   # Current ops snapshot + bug history
 └── README.md
 ```
 
@@ -169,113 +223,109 @@ crypto-trading-lab/
 
 ## ⚙️ Configuration
 
-### `data/trading-journal/account_config.json`
-```json
-{
-  "mode": "paper",
-  "execution": "paper_with_live_executor",
-  "preset": "aggressive",
-  "maxRiskPerTradePct": 2,
-  "maxOpenPositions": 1,
-  "dailyKillSwitchR": -3,
-  "minVolumeRatio": 1.5,
-  "minScoreToTrade": 40,
-  "minAdx": 18,
-  "minExpectedR": 1.8
-}
-```
-
-### `data/trading-journal/okx_config.json`
+### `okx_config.json`
 ```json
 {
   "max_capital_usdt": 100,
   "risk_per_trade_pct": 2.0,
   "max_daily_drawdown_pct": 10.0,
-  "circuit_breaker_consecutive_losses": 3
+  "circuit_breaker_consecutive_losses": 3,
+  "allowed_symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "...19 total"]
+}
+```
+
+### `account_config.json`
+```json
+{
+  "preset": "aggressive",
+  "maxOpenPositions": 3,
+  "dailyKillSwitchR": -3,
+  "realtimeSymbols": ["BTCUSDT", "ETHUSDT", "...19 total"]
 }
 ```
 
 ---
 
-## 🚀 Setup & Running
+## 🚀 Build & Run
 
-### Prerequisites
-- macOS (uses LaunchAgents)
-- Rust + Cargo
-- Python 3 (for OKX SDK)
-- OKX API key (read + trade permissions, acctLv=1)
-
-### Build
 ```bash
 cd engine
+
+# Build all binaries
 cargo build --release
+
+# Run tests (142 total, 0 warnings)
+cargo test
+
+# Specific binary
+cargo build --release --bin live-executor
+cargo build --release --bin sim-engine
 ```
 
-### Run Tests
+### LaunchAgents (macOS, auto-start on login)
 ```bash
-cargo test --bin live-executor  # 47 tests
-cargo test --bin sim-engine     # 28 tests (indicators + strategy)
-# Total: 75 tests
-```
-
-### LaunchAgents (auto-start on login)
-```bash
-# Register all services
-launchctl load ~/Library/LaunchAgents/ai.openclaw.live-executor.plist
-launchctl load ~/Library/LaunchAgents/ai.openclaw.realtime-engine.plist
-launchctl load ~/Library/LaunchAgents/ai.openclaw.sim-engine.plist
-
-# Check status
-launchctl list | grep openclaw
-
-# Manual restart
+# Restart services
 launchctl kickstart -k gui/$(id -u)/ai.openclaw.live-executor
 launchctl kickstart -k gui/$(id -u)/ai.openclaw.realtime-engine
+launchctl kickstart -k gui/$(id -u)/ai.openclaw.sim-engine
+
+# Check status
+pgrep -f "live-executor"  && echo "✅ executor"  || echo "❌ executor DEAD"
+pgrep -f "realtime-daemon" && echo "✅ realtime" || echo "❌ realtime DEAD"
 ```
 
 ### Monitor
 ```bash
-# Real-time OKX balance + open positions
+# Real-time OKX balance + positions
 bash scripts/okx_monitor.sh
 
-# Check all services
-pgrep -f "live-executor" && echo "✅ executor" || echo "❌ executor DEAD"
-pgrep -f "realtime-daemon" && echo "✅ realtime" || echo "❌ realtime DEAD"
-launchctl list | grep "openclaw.sim-engine"
+# Market pulse (H4 indicators, all 19 coins)
+python3 -c "
+import json, datetime
+d = json.load(open('data/trading-journal/realtime_cache.json'))
+for sym, v in d.get('symbols', {}).items():
+    price = v.get('price', 0); rsi = v.get('rsi14', 0)
+    ema20 = v.get('ema20', 0); ema50 = v.get('ema50', 0)
+    vol   = v.get('volume_ratio', 0)
+    align = '✅' if (price > ema20 > ema50) else '❌'
+    print(f'{sym:<12} \${price:>10.2f}  EMA{align}  RSI={rsi:>5.1f}  vol={vol:.2f}x')
+"
+
+# Recent signals
+sqlite3 data/trading-journal/sim_history.db \
+  "SELECT decision, setup_idea, inserted_at FROM simulation_events ORDER BY id DESC LIMIT 5;"
+
+# Today's PnL
+sqlite3 data/trading-journal/live_positions.db \
+  "SELECT trade_date, starting_equity, realized_pnl, trade_count FROM daily_stats ORDER BY trade_date DESC LIMIT 3;"
+
+# Executor log
+tail -30 /tmp/openclaw/live-executor.log
 ```
 
 ---
 
-## 📈 Performance Tracking
+## 📈 Performance
 
-### Database Schema
-```sql
--- Signal decisions
-processed_signals (signal_id, symbol, direction, entry, stop, tp1, status, fill_price, pnl_usdt)
+| Date | PnL | Trades | Notes |
+|------|-----|--------|-------|
+| 2026-02-18 | −$0.57 | 1 | First live trade, BNBUSDT, pre-fix |
+| 2026-02-22 | +$3.83 | 3 | AVAXUSDT, bug era (SL di atas entry) |
+| 2026-02-25 | +$2.90 | 5 | Best day — SOL TP×3, ETH+SOL TP2 |
+| 2026-02-26 | +$1.99 | 3 | ETH ×2 CLOSED_TIME, sistem stabil |
 
--- Open positions
-open_positions (signal_id, symbol, qty, entry_price, stop_price, tp1_price, risk_usdt, opened_at)
+**Starting capital:** ~$115 USDT
+**Current equity:** ~$122 USDT
+**Live since:** 2026-02-18
 
--- Daily stats
-daily_stats (trade_date, starting_equity, realized_pnl, consecutive_losses, trade_count)
+---
 
--- Simulation history (15-min cadence)
-simulation_events (trade_date, trade_time, decision, quality_gate, confidence, expected_value_r, rationale)
-```
+## 🔒 Security
 
-### Status Values
-```
-FILLED          → order executed, position open
-CLOSED_TP       → take profit hit
-CLOSED_SL       → stop loss hit
-CLOSED_TIME     → 60-min max hold reached
-SKIPPED_STALE   → price moved 3-10% (DYNAMIC path taken)
-SKIPPED_CHASING → price ran >10% (skip)
-SKIPPED_DUMPED  → price fell >3% (skip)
-SKIPPED_TIER_C  → signal EV/confidence too weak
-SKIPPED_CORR    → correlation limit reached
-ABORTED         → order placed but SL invalid
-```
+- API keys in `okx_config.json` (gitignored)
+- Trade permission only — **no withdraw**
+- IP whitelist recommended for production
+- `cancel_pending_algos()` called before every sell (prevents OKX balance freeze)
 
 ---
 
@@ -283,31 +333,11 @@ ABORTED         → order placed but SL invalid
 
 | Limitation | Impact | Mitigation |
 |-----------|--------|-----------|
-| OKX acctLv=1: no algo orders | Software SL only | 60s poll, market sell on breach |
-| Software SL latency | Flash crash risk | Acceptable trade-off vs unlimited downside |
-| 5-min signal cadence | May miss fast pumps | Reduced from 15min; covers >90% of large-cap moves |
-| Small sample size | Edge not fully proven | Track 50+ trades before scaling capital |
+| OKX acctLv=1: no algo conditional orders | Software SL only | 60s poll + cancel_algos before sell |
+| Software SL latency (~60s) | Flash crash risk | OKX algo SL as crash backup |
+| 5-min signal cadence | May miss fast micro-pumps | Covers >90% large-cap moves |
+| H4 indicators lag short-term | May block valid 15m setups | By design — filters noise |
 
 ---
 
-## 📅 Live Performance
-
-| Date | PnL | Trades | Notes |
-|------|-----|--------|-------|
-| 2026-02-18 | -0.50% | 1 | First live trade (BNBUSDT, SL hit, pre-fix) |
-| 2026-02-25 | +2.53% | 3 | Best day — 3 SOL profitable, manual fix |
-| 2026-02-25 (eve) | +4.12%+ | 2 | ETH+SOL open, both near TP1 |
-
-Starting capital: ~$115 USDT | Current: ~$120 USDT
-
----
-
-## 🔒 Security
-
-- API keys stored in `okx_config.json` (gitignored)
-- Read + Trade permissions only (no withdraw)
-- All secrets excluded from this repo
-
----
-
-*Built with ❤️ + lots of debugging. Iteration > perfection.*
+*Built with love by beb & Radit* ❤️
