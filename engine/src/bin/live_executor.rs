@@ -14,50 +14,66 @@ use rusqlite::{Connection, params};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::{fs, path::{Path, PathBuf}, thread, time::Duration as StdDuration};
+use std::{collections::HashMap, fs, path::{Path, PathBuf}, thread, time::Duration as StdDuration};
 
 // ── Constants ────────────────────────────────────────────────────────────────
-const MAX_SIGNAL_AGE_MIN: i64 = 20;
-// MAX_HOLD_MIN removed — replaced by per-coin max_hold_min(symbol) function
-const POLL_INTERVAL_SECS:  u64 = 60;
-const OKX_BASE: &str           = "https://www.okx.com";
-const MAX_OPEN_POSITIONS:  i64 = 3;   // max concurrent positions
-const MAX_PORTFOLIO_RISK:  f64 = 0.06; // max 6% total risk deployed at once
-const TRAIL_PCT:           f64 = 0.025; // 2.5% trailing stop — activates after TP1 (half_exited=1)
-                                         // trail_sl = high_water * (1 - TRAIL_PCT), only if > entry
+const OKX_BASE: &str = "https://www.okx.com";
 
-// Correlation groups — max 1 open per group simultaneously
-const CORR_GROUP_1: &[&str] = &["BTCUSDT", "ETHUSDT"];                         // large cap, high corr
-const CORR_GROUP_2: &[&str] = &["SOLUSDT", "BNBUSDT", "ADAUSDT"];              // L1 alts
-const CORR_GROUP_3: &[&str] = &["AVAXUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "NEARUSDT"]; // L1/L2 beta
-const CORR_GROUP_4: &[&str] = &["DOGEUSDT", "LTCUSDT"];                        // legacy/meme
-
-// Per-coin max allocation % of equity (smaller = more volatile/risky)
-fn coin_max_alloc(symbol: &str) -> f64 {
-    match symbol {
-        "BTCUSDT" | "ETHUSDT"                        => 0.40, // large cap
-        "SOLUSDT" | "BNBUSDT" | "XRPUSDT"           => 0.25, // mid cap
-        "ADAUSDT" | "DOGEUSDT" | "DOTUSDT"  |
-        "AVAXUSDT"| "NEARUSDT" | "UNIUSDT"  |
-        "LINKUSDT"| "LTCUSDT"                        => 0.20, // established alts
-        _                                            => 0.15, // high-beta (FIL, APT, SUI, ARB, OP, INJ…)
-    }
+// ── Executor Config (loaded from executor_config.json) ───────────────────────
+#[derive(Debug, Deserialize)]
+struct PumpFilter {
+    vol_threshold:      f64,
+    rsi_threshold:      f64,
+    stretch_multiplier: f64,
 }
 
-/// Per-coin time-stop (max hold duration in minutes).
-/// Large caps move slowly and need more time to develop a move.
-/// High-beta alts are fast and should be cut quickly if stalling.
-fn max_hold_min(symbol: &str) -> i64 {
-    match symbol {
-        // Large cap — slow, needs 2h to develop momentum
-        "BTCUSDT" | "ETHUSDT"                        => 120,
-        // Mid cap — moderate speed, 90 min is fair
-        "SOLUSDT" | "BNBUSDT" | "XRPUSDT"  |
-        "ADAUSDT" | "DOTUSDT" | "LINKUSDT"  |
-        "LTCUSDT" | "DOGEUSDT"                       => 90,
-        // High-beta / fast alts — keep tight at 60 min
-        _                                            => 60,
-    }
+#[derive(Debug, Deserialize)]
+struct KellyTier {
+    min_ev:        f64,
+    min_conf:      f64,
+    risk_pct_low:  f64,
+    risk_pct_high: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct KellyTierC {
+    max_ev:   f64,
+    max_conf: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct KellyConfig {
+    fraction:  f64,
+    tier_a:    KellyTier,
+    tier_b:    KellyTier,
+    tier_c:    KellyTierC,
+    floor_pct: f64,
+    ceil_pct:  f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecutorConfig {
+    max_signal_age_min:     i64,
+    poll_interval_secs:     u64,
+    max_open_positions:     i64,
+    max_portfolio_risk_pct: f64,
+    trail_pct:              f64,
+    cooldown_min:           i64,
+    pump_filter:            PumpFilter,
+    hold_min_default:       i64,
+    hold_min:               HashMap<String, i64>,
+    coin_max_alloc_default: f64,
+    coin_max_alloc:         HashMap<String, f64>,
+    correlation_groups:     Vec<Vec<String>>,
+    kelly:                  KellyConfig,
+}
+
+fn coin_max_alloc(ecfg: &ExecutorConfig, symbol: &str) -> f64 {
+    ecfg.coin_max_alloc.get(symbol).copied().unwrap_or(ecfg.coin_max_alloc_default)
+}
+
+fn max_hold_min(ecfg: &ExecutorConfig, symbol: &str) -> i64 {
+    ecfg.hold_min.get(symbol).copied().unwrap_or(ecfg.hold_min_default)
 }
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -94,11 +110,12 @@ struct Signal {
 
 // ── Kelly Sizing ─────────────────────────────────────────────────────────────
 /// Returns risk fraction to use for this signal (e.g. 0.02 = 2% of equity)
-fn kelly_risk_fraction(sig: &Signal, base_risk: f64) -> f64 {
+fn kelly_risk_fraction(sig: &Signal, base_risk: f64, ecfg: &ExecutorConfig) -> f64 {
     let ev   = sig.ev.unwrap_or(0.0);
     let p_up = sig.p_up.unwrap_or(0.5);
     let p_dn = sig.p_down.unwrap_or(0.5);
     let conf = sig.confidence.unwrap_or(0.0);
+    let k    = &ecfg.kelly;
 
     // Full Kelly: f* = (p_up * ev - p_down) / ev
     let kelly_full = if ev > 0.0 {
@@ -107,39 +124,40 @@ fn kelly_risk_fraction(sig: &Signal, base_risk: f64) -> f64 {
         0.0
     };
 
-    // Fractional Kelly (25%), scaled by confidence
+    // Fractional Kelly, scaled by confidence
     let conf_scale = (conf / 0.5).min(1.0).max(0.2);  // 20–100% scale
-    let frac_kelly = kelly_full * 0.25 * conf_scale;
+    let frac_kelly = kelly_full * k.fraction * conf_scale;
 
     // Tier enforcement
-    let tier_risk = if ev >= 2.0 && conf >= 0.5 {
-        // Tier A: strong signal → 3–4%
-        frac_kelly.max(0.03).min(0.04)
-    } else if ev >= 1.0 && conf >= 0.3 {
-        // Tier B: normal → 1.5–2%
-        frac_kelly.max(0.015).min(0.025)
+    let tier_risk = if ev >= k.tier_a.min_ev && conf >= k.tier_a.min_conf {
+        // Tier A: strong signal
+        frac_kelly.max(k.tier_a.risk_pct_low / 100.0).min(k.tier_a.risk_pct_high / 100.0)
+    } else if ev >= k.tier_b.min_ev && conf >= k.tier_b.min_conf {
+        // Tier B: normal
+        frac_kelly.max(k.tier_b.risk_pct_low / 100.0).min(k.tier_b.risk_pct_high / 100.0)
     } else {
         // Tier C: weak → use base risk or skip
         base_risk * 0.5
     };
 
-    tier_risk.max(0.01).min(0.04) // hard floor 1%, ceiling 4%
+    tier_risk.max(k.floor_pct / 100.0).min(k.ceil_pct / 100.0)
 }
 
 /// Signal is worth trading at all?
-fn should_trade(sig: &Signal) -> bool {
+fn should_trade(sig: &Signal, ecfg: &ExecutorConfig) -> bool {
     let ev   = sig.ev.unwrap_or(0.0);
     let conf = sig.confidence.unwrap_or(0.0);
-    // Skip very weak signals: EV < 0.5R or confidence < 0.15
-    ev >= 0.5 && conf >= 0.15
+    // Skip very weak signals below tier C thresholds
+    ev >= ecfg.kelly.tier_c.max_ev && conf >= ecfg.kelly.tier_c.max_conf
 }
 
 /// Tier label for logging
-fn signal_tier(sig: &Signal) -> &'static str {
+fn signal_tier(sig: &Signal, ecfg: &ExecutorConfig) -> &'static str {
     let ev   = sig.ev.unwrap_or(0.0);
     let conf = sig.confidence.unwrap_or(0.0);
-    if ev >= 2.0 && conf >= 0.5 { "A" }
-    else if ev >= 1.0 && conf >= 0.3 { "B" }
+    let k    = &ecfg.kelly;
+    if ev >= k.tier_a.min_ev && conf >= k.tier_a.min_conf { "A" }
+    else if ev >= k.tier_b.min_ev && conf >= k.tier_b.min_conf { "B" }
     else { "C" }
 }
 
@@ -270,14 +288,14 @@ fn compute_tp2(entry: f64, tp1: f64) -> f64 {
 /// Compute trailing stop level.
 /// Rules:
 ///   • Only active after TP1 is hit (half_exited == 1)
-///   • trail_sl = high_water × (1 – TRAIL_PCT)
+///   • trail_sl = high_water × (1 – trail_pct)
 ///   • Only valid if trail_sl > entry (never trail below breakeven)
 ///   • Returns 0.0 when inactive
-fn compute_trail_sl(half_exited: i64, high_water: f64, entry: f64) -> f64 {
+fn compute_trail_sl(half_exited: i64, high_water: f64, entry: f64, trail_pct: f64) -> f64 {
     if half_exited != 1 || high_water <= entry {
         return 0.0;
     }
-    let ts = high_water * (1.0 - TRAIL_PCT);
+    let ts = high_water * (1.0 - trail_pct);
     if ts > entry { ts } else { 0.0 }
 }
 
@@ -290,11 +308,7 @@ fn is_noisy_window() -> bool {
 
 /// Pump/dump protection — reads RSI, volume_ratio, and price vs EMA20 from the realtime cache.
 /// Returns true (= block entry) if pattern suggests active manipulation or exhaustion.
-///
-/// Block if ANY of:
-///   • volume_ratio > 4.0 AND RSI > 78 (volume-driven pump, overbought)
-///   • price > EMA20 × 1.08 (price stretched >8% above EMA20 — too late, chasing a pump)
-fn is_pump_or_exhausted(symbol: &str, cache_path: &Path) -> bool {
+fn is_pump_or_exhausted(symbol: &str, cache_path: &Path, ecfg: &ExecutorConfig) -> bool {
     let cache_file = cache_path.join("trading-journal/realtime_cache.json");
     let text = match std::fs::read_to_string(&cache_file) { Ok(t) => t, Err(_) => return false };
     let d: serde_json::Value = match serde_json::from_str(&text) { Ok(v) => v, Err(_) => return false };
@@ -303,8 +317,9 @@ fn is_pump_or_exhausted(symbol: &str, cache_path: &Path) -> bool {
     let vol  = sym["volume_ratio"].as_f64().unwrap_or(1.0);
     let price = sym["price"].as_f64().unwrap_or(0.0);
     let ema20 = sym["ema20"].as_f64().unwrap_or(0.0);
-    let vol_pump  = vol > 4.0 && rsi > 78.0;
-    let stretched = ema20 > 0.0 && price > ema20 * 1.08;
+    let pf = &ecfg.pump_filter;
+    let vol_pump  = vol > pf.vol_threshold && rsi > pf.rsi_threshold;
+    let stretched = ema20 > 0.0 && price > ema20 * pf.stretch_multiplier;
     vol_pump || stretched
 }
 
@@ -445,10 +460,10 @@ fn append_journal(base: &Path, block: &str) {
     println!("[executor] 📝 Journal updated");
 }
 
-fn journal_opened(base: &Path, sig: &Signal, fill: f64, usdt: f64, equity: f64, risk_frac: f64, hold_min: i64) {
+fn journal_opened(base: &Path, sig: &Signal, fill: f64, usdt: f64, equity: f64, risk_frac: f64, hold_min: i64, ecfg: &ExecutorConfig) {
     let t   = Local::now().format("%H:%M").to_string();
     let ev  = sig.ev.map(|e| format!("{:+.2}R", e)).unwrap_or_else(|| "N/A".to_string());
-    let tier = signal_tier(sig);
+    let tier = signal_tier(sig, &ecfg);
     let block = format!("\n\
 ## Live Trade OPENED — {} WIB [Rust v2]\n\
 - **Symbol:** {} {} | **Tier:** {} | **Fill:** {:.4}\n\
@@ -651,12 +666,8 @@ fn is_risk_ok(cb_hit: bool, consec_losses: i64, drawdown: f64, max_losses: u32, 
 }
 
 // ── Correlation check ────────────────────────────────────────────────────────
-fn corr_group_blocked(conn: &Connection, symbol: &str) -> bool {
-    let group: Option<&[&str]> = if CORR_GROUP_1.contains(&symbol) { Some(CORR_GROUP_1) }
-        else if CORR_GROUP_2.contains(&symbol) { Some(CORR_GROUP_2) }
-        else if CORR_GROUP_3.contains(&symbol) { Some(CORR_GROUP_3) }
-        else if CORR_GROUP_4.contains(&symbol) { Some(CORR_GROUP_4) }
-        else { None };
+fn corr_group_blocked(conn: &Connection, symbol: &str, ecfg: &ExecutorConfig) -> bool {
+    let group = ecfg.correlation_groups.iter().find(|g| g.iter().any(|s| s == symbol));
     if let Some(grp) = group {
         for sym in grp {
             if has_open_position(conn, sym) {
@@ -677,6 +688,9 @@ fn main() -> Result<()> {
     };
 
     let cfg: Config = serde_json::from_str(&fs::read_to_string(base.join("okx_config.json"))?)?;
+    let ecfg: ExecutorConfig = serde_json::from_str(&fs::read_to_string(base.join("executor_config.json"))?)?;
+    let trail_pct = ecfg.trail_pct / 100.0;
+    let max_portfolio_risk = ecfg.max_portfolio_risk_pct / 100.0;
     let base_risk = cfg.risk_per_trade_pct / 100.0;
     let max_dd    = cfg.max_daily_drawdown_pct / 100.0;
     let cb_losses = cfg.circuit_breaker_consecutive_losses;
@@ -688,11 +702,11 @@ fn main() -> Result<()> {
     init_live_db(&live_conn)?;
 
     println!("[executor] 🦀 Live Executor v2 (Kelly+MultiPos) | BaseRisk={:.0}% | MaxPos={} | MaxPortRisk={:.0}%",
-        cfg.risk_per_trade_pct, MAX_OPEN_POSITIONS, MAX_PORTFOLIO_RISK * 100.0);
+        cfg.risk_per_trade_pct, ecfg.max_open_positions, ecfg.max_portfolio_risk_pct);
 
     loop {
         let today  = Local::now().format("%Y-%m-%d").to_string();
-        let cutoff = (Local::now() - Duration::minutes(MAX_SIGNAL_AGE_MIN)).format("%H:%M").to_string();
+        let cutoff = (Local::now() - Duration::minutes(ecfg.max_signal_age_min)).format("%H:%M").to_string();
 
         let equity = get_equity(&client, &cfg).unwrap_or(116.0);
         let (realized_pnl, consec_losses, _tc, cb_hit) = get_daily_stats(&live_conn, &today, equity);
@@ -734,14 +748,14 @@ fn main() -> Result<()> {
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_SHORT",0.0,"");
                     continue;
                 }
-                if !should_trade(&sig) {
+                if !should_trade(&sig, &ecfg) {
                     println!("[executor] ⏩ Tier C skip: EV={:.2} Conf={:.2}", ev.unwrap_or(0.0), conf.unwrap_or(0.0));
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_TIER_C",0.0,
                         &format!("ev={:.2} conf={:.2}", ev.unwrap_or(0.0), conf.unwrap_or(0.0)));
                     continue;
                 }
-                if count_open_positions(&live_conn) >= MAX_OPEN_POSITIONS {
-                    println!("[executor] ⏩ Max positions ({}) reached", MAX_OPEN_POSITIONS);
+                if count_open_positions(&live_conn) >= ecfg.max_open_positions {
+                    println!("[executor] ⏩ Max positions ({}) reached", ecfg.max_open_positions);
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_MAXPOS",0.0,"");
                     continue;
                 }
@@ -749,18 +763,19 @@ fn main() -> Result<()> {
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_DUPE",0.0,"");
                     continue;
                 }
-                // 30-min cooldown after any closed position on the same symbol
-                if cooldown_active(&live_conn, &sig.symbol, 30) {
+                // Cooldown after any closed position on the same symbol
+                if cooldown_active(&live_conn, &sig.symbol, ecfg.cooldown_min) {
                     println!("[executor] ⏳ Cooldown: {} closed recently, skipping", sig.symbol);
-                    mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_COOLDOWN",0.0,"30min cooldown after close");
+                    mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_COOLDOWN",0.0,
+                        &format!("{}min cooldown after close", ecfg.cooldown_min));
                     continue;
                 }
-                if corr_group_blocked(&live_conn, &sig.symbol) {
+                if corr_group_blocked(&live_conn, &sig.symbol, &ecfg) {
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_CORR",0.0,"");
                     continue;
                 }
-                if total_risk_deployed(&live_conn, equity) >= MAX_PORTFOLIO_RISK {
-                    println!("[executor] ⏩ Portfolio risk cap {:.0}% reached", MAX_PORTFOLIO_RISK * 100.0);
+                if total_risk_deployed(&live_conn, equity) >= max_portfolio_risk {
+                    println!("[executor] ⏩ Portfolio risk cap {:.0}% reached", ecfg.max_portfolio_risk_pct);
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_PORT_RISK",0.0,"");
                     continue;
                 }
@@ -801,25 +816,25 @@ fn main() -> Result<()> {
 
                 // ── Time filter: noisy Asian pre-market (07:00–07:30 WIB) ────────────
                 // Historical data: P(up)=0.68 in this window vs 0.92 outside → require Tier A only
-                if is_noisy_window() && signal_tier(&sig) != "A" {
+                if is_noisy_window() && signal_tier(&sig, &ecfg) != "A" {
                     println!("[executor] ⏰ Noisy window (07:00-07:30 WIB) — skipping non-Tier-A signal");
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_NOISY_WINDOW",0.0,"07:00-07:30 WIB tier<A");
                     continue;
                 }
 
                 // ── Pump/dump protection ─────────────────────────────────────────────
-                if is_pump_or_exhausted(&sig.symbol, &base.join("../..")) {
+                if is_pump_or_exhausted(&sig.symbol, &base.join("../.."), &ecfg) {
                     println!("[executor] 🚨 Pump/dump detected for {} — skipping entry", sig.symbol);
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_PUMP_DUMP",0.0,"vol>4×+RSI>78 or price>EMA20×1.08");
                     continue;
                 }
 
                 // ── Kelly-sized position ──────────────────────────────────────
-                let risk_frac   = kelly_risk_fraction(&sig, base_risk);
+                let risk_frac   = kelly_risk_fraction(&sig, base_risk, &ecfg);
                 let avail_usdt  = get_avail_usdt(&client, &cfg).unwrap_or(0.0);
 
                 // Coin allocation cap
-                let max_spend   = equity * coin_max_alloc(&sig.symbol);
+                let max_spend   = equity * coin_max_alloc(&ecfg, &sig.symbol);
                 let stop_dist   = (sig.entry - sig.stop).abs();
                 if stop_dist <= 0.0 { continue; }
                 let risk_usdt   = equity * risk_frac;
@@ -835,7 +850,7 @@ fn main() -> Result<()> {
                 }
 
                 println!("[executor] 🚀 {} {} | Tier={} EV={:.1}R Risk={:.1}% Spend={:.2}U SL={:.4} TP={:.4}",
-                    sig.direction, sig.symbol, signal_tier(&sig),
+                    sig.direction, sig.symbol, signal_tier(&sig, &ecfg),
                     ev.unwrap_or(0.0), risk_frac*100.0, usdt_spend, sig.stop, sig.tp1);
 
                 // ── Execute ───────────────────────────────────────────────────
@@ -896,11 +911,11 @@ fn main() -> Result<()> {
                             live_conn.execute(
                                 "UPDATE daily_stats SET trade_count=trade_count+1 WHERE trade_date=?",
                                 params![today]).ok();
-                            journal_opened(&base, &sig, fill, usdt_spend, equity, risk_frac, max_hold_min(&sig.symbol));
+                            journal_opened(&base, &sig, fill, usdt_spend, equity, risk_frac, max_hold_min(&ecfg, &sig.symbol), &ecfg);
                             mark_processed(&live_conn, sig_id, &sig.symbol, &sig.direction,
                                            sig.entry, actual_stop, actual_tp1, &order_id, "FILLED", fill,
                                            &format!("tier={} ev={:.2} risk={:.1}%",
-                                               signal_tier(&sig), ev.unwrap_or(0.0), risk_frac*100.0));
+                                               signal_tier(&sig, &ecfg), ev.unwrap_or(0.0), risk_frac*100.0));
                         }
                     }
                     Err(e) => {
@@ -942,7 +957,7 @@ fn main() -> Result<()> {
                     params![high_water, pid]).ok();
             }
             // trail_sl: only active after TP1 (half_exited=1) AND above entry (can't trail into loss)
-            let trail_sl = compute_trail_sl(half_exited, high_water, entry);
+            let trail_sl = compute_trail_sl(half_exited, high_water, entry, trail_pct);
 
             let fake = Signal { id: sig_id, symbol: symbol.clone(), direction: direction.clone(),
                 entry, stop, tp1, _tp2: None, risk_pct: base_risk,
@@ -997,7 +1012,7 @@ fn main() -> Result<()> {
                 else { println!("[executor] ⚠️  Trail sell failed — retrying"); (false, 0.0, "", String::new()) }
 
             // ── Time exit ─────────────────────────────────────────────────────
-            } else if hold_min >= max_hold_min(&symbol) {
+            } else if hold_min >= max_hold_min(&ecfg, &symbol) {
                 cancel_pending_algos(&client, &cfg, &inst);
                 let p = (current - entry) * qty;
                 println!("[executor] ⏱️  Time exit {} {}min @ {:.4}", symbol, hold_min, current);
@@ -1032,7 +1047,7 @@ fn main() -> Result<()> {
             }
         }
 
-        thread::sleep(StdDuration::from_secs(POLL_INTERVAL_SECS));
+        thread::sleep(StdDuration::from_secs(ecfg.poll_interval_secs));
     }
 }
 
@@ -1043,6 +1058,57 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_ecfg() -> ExecutorConfig {
+        let mut hold_min = std::collections::HashMap::new();
+        // Large cap
+        hold_min.insert("BTCUSDT".to_string(), 120i64);
+        hold_min.insert("ETHUSDT".to_string(), 120i64);
+        // Mid cap — 90min
+        for sym in &["SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","DOTUSDT","LINKUSDT","LTCUSDT","DOGEUSDT"] {
+            hold_min.insert(sym.to_string(), 90i64);
+        }
+        let mut coin_alloc = std::collections::HashMap::new();
+        // Large cap
+        coin_alloc.insert("BTCUSDT".to_string(), 0.40f64);
+        coin_alloc.insert("ETHUSDT".to_string(), 0.40f64);
+        // Mid cap — 25%
+        coin_alloc.insert("SOLUSDT".to_string(), 0.25f64);
+        coin_alloc.insert("BNBUSDT".to_string(), 0.25f64);
+        coin_alloc.insert("XRPUSDT".to_string(), 0.25f64);
+        // Established alts — 20%
+        for sym in &["ADAUSDT","DOGEUSDT","DOTUSDT","AVAXUSDT","NEARUSDT","UNIUSDT","LINKUSDT","LTCUSDT"] {
+            coin_alloc.insert(sym.to_string(), 0.20f64);
+        }
+        ExecutorConfig {
+            max_signal_age_min: 20,
+            poll_interval_secs: 60,
+            max_open_positions: 3,
+            max_portfolio_risk_pct: 6.0,
+            trail_pct: 2.5,
+            cooldown_min: 30,
+            pump_filter: PumpFilter { vol_threshold: 4.0, rsi_threshold: 78.0, stretch_multiplier: 1.08 },
+            hold_min_default: 60,
+            hold_min,
+            coin_max_alloc_default: 0.15,
+            coin_max_alloc: coin_alloc,
+            correlation_groups: vec![
+                vec!["BTCUSDT".into(), "ETHUSDT".into()],
+                vec!["SOLUSDT".into(), "BNBUSDT".into(), "ADAUSDT".into()],
+                vec!["AVAXUSDT".into(), "APTUSDT".into(), "ARBUSDT".into(), "OPUSDT".into(), "NEARUSDT".into()],
+                vec!["DOGEUSDT".into(), "LTCUSDT".into()],
+            ],
+            kelly: KellyConfig {
+                fraction: 0.25,
+                tier_a: KellyTier { min_ev: 1.5, min_conf: 0.70, risk_pct_low: 3.0, risk_pct_high: 4.0 },
+                tier_b: KellyTier { min_ev: 0.8, min_conf: 0.40, risk_pct_low: 1.5, risk_pct_high: 2.5 },
+                tier_c: KellyTierC { max_ev: 0.5, max_conf: 0.15 },
+                floor_pct: 1.0,
+                ceil_pct: 4.0,
+            },
+        }
+    }
+
 
     // ── Helper: build a minimal Signal for tests ─────────────────────────────
     fn sig(ev: f64, p_up: f64, p_down: f64, conf: f64, entry: f64, stop: f64, tp1: f64) -> Signal {
@@ -1195,7 +1261,7 @@ mod tests {
     fn kelly_tier_a_range() {
         // Tier A: EV>=2, conf>=0.5 → risk 3-4%
         let s = sig(2.5, 0.75, 0.25, 0.7, 79.0, 76.5, 81.0);
-        let r = kelly_risk_fraction(&s, 0.02);
+        let r = kelly_risk_fraction(&s, 0.02, &test_ecfg());
         assert!(r >= 0.03 && r <= 0.04, "Tier A risk {:.3} out of 3-4% range", r);
     }
 
@@ -1203,7 +1269,7 @@ mod tests {
     fn kelly_tier_b_range() {
         // Tier B: EV>=1, conf>=0.3 → risk 1.5-2.5%
         let s = sig(1.5, 0.65, 0.35, 0.4, 79.0, 76.5, 81.0);
-        let r = kelly_risk_fraction(&s, 0.02);
+        let r = kelly_risk_fraction(&s, 0.02, &test_ecfg());
         assert!(r >= 0.015 && r <= 0.025, "Tier B risk {:.3} out of 1.5-2.5% range", r);
     }
 
@@ -1211,7 +1277,7 @@ mod tests {
     fn kelly_hard_ceiling_4pct() {
         // Even with very strong signal, risk capped at 4%
         let s = sig(10.0, 0.99, 0.01, 1.0, 79.0, 76.5, 81.0);
-        let r = kelly_risk_fraction(&s, 0.02);
+        let r = kelly_risk_fraction(&s, 0.02, &test_ecfg());
         assert!(r <= 0.04, "Kelly ceiling violated: {:.3}", r);
     }
 
@@ -1219,7 +1285,7 @@ mod tests {
     fn kelly_hard_floor_1pct() {
         // Even with very weak signal, minimum 1%
         let s = sig(0.1, 0.51, 0.49, 0.01, 79.0, 76.5, 81.0);
-        let r = kelly_risk_fraction(&s, 0.02);
+        let r = kelly_risk_fraction(&s, 0.02, &test_ecfg());
         assert!(r >= 0.01, "Kelly floor violated: {:.3}", r);
     }
 
@@ -1229,26 +1295,28 @@ mod tests {
 
     #[test]
     fn tier_a_classification() {
-        let s = sig(2.0, 0.75, 0.25, 0.5, 79.0, 76.5, 81.0);
-        assert_eq!(signal_tier(&s), "A");
+        // Tier A: EV>=1.5, conf>=0.70
+        let s = sig(2.0, 0.75, 0.25, 0.7, 79.0, 76.5, 81.0);
+        assert_eq!(signal_tier(&s, &test_ecfg()), "A");
     }
 
     #[test]
     fn tier_b_classification() {
-        let s = sig(1.0, 0.65, 0.35, 0.3, 79.0, 76.5, 81.0);
-        assert_eq!(signal_tier(&s), "B");
+        // Tier B: EV>=0.8, conf>=0.40
+        let s = sig(1.0, 0.65, 0.35, 0.5, 79.0, 76.5, 81.0);
+        assert_eq!(signal_tier(&s, &test_ecfg()), "B");
     }
 
     #[test]
     fn tier_c_low_ev() {
         let s = sig(0.4, 0.55, 0.45, 0.6, 79.0, 76.5, 81.0);
-        assert_eq!(signal_tier(&s), "C");
+        assert_eq!(signal_tier(&s, &test_ecfg()), "C");
     }
 
     #[test]
     fn tier_c_low_conf() {
         let s = sig(2.0, 0.75, 0.25, 0.2, 79.0, 76.5, 81.0);
-        assert_eq!(signal_tier(&s), "C"); // conf < 0.5 → not A
+        assert_eq!(signal_tier(&s, &test_ecfg()), "C"); // conf < 0.5 → not A
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -1258,19 +1326,19 @@ mod tests {
     #[test]
     fn should_trade_passes_valid_signal() {
         let s = sig(1.0, 0.65, 0.35, 0.3, 79.0, 76.5, 81.0);
-        assert!(should_trade(&s));
+        assert!(should_trade(&s, &test_ecfg()));
     }
 
     #[test]
     fn should_trade_blocks_low_ev() {
         let s = sig(0.4, 0.55, 0.45, 0.5, 79.0, 76.5, 81.0);
-        assert!(!should_trade(&s), "EV=0.4 should be blocked");
+        assert!(!should_trade(&s, &test_ecfg()), "EV=0.4 should be blocked");
     }
 
     #[test]
     fn should_trade_blocks_low_confidence() {
         let s = sig(2.0, 0.75, 0.25, 0.1, 79.0, 76.5, 81.0);
-        assert!(!should_trade(&s), "conf=0.1 should be blocked");
+        assert!(!should_trade(&s, &test_ecfg()), "conf=0.1 should be blocked");
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -1291,25 +1359,25 @@ mod tests {
 
     #[test]
     fn coin_alloc_btc_eth_highest() {
-        assert_eq!(coin_max_alloc("BTCUSDT"), 0.40);
-        assert_eq!(coin_max_alloc("ETHUSDT"), 0.40);
+        assert_eq!(coin_max_alloc(&test_ecfg(), "BTCUSDT"), 0.40);
+        assert_eq!(coin_max_alloc(&test_ecfg(), "ETHUSDT"), 0.40);
     }
 
     #[test]
     fn coin_alloc_sol_bnb_mid() {
-        assert_eq!(coin_max_alloc("SOLUSDT"), 0.25);
-        assert_eq!(coin_max_alloc("BNBUSDT"), 0.25);
+        assert_eq!(coin_max_alloc(&test_ecfg(), "SOLUSDT"), 0.25);
+        assert_eq!(coin_max_alloc(&test_ecfg(), "BNBUSDT"), 0.25);
     }
 
     #[test]
     fn coin_alloc_atom_lowest() {
-        assert_eq!(coin_max_alloc("ATOMUSDT"), 0.15);
+        assert_eq!(coin_max_alloc(&test_ecfg(), "ATOMUSDT"), 0.15);
     }
 
     #[test]
     fn coin_alloc_unknown_default() {
         // Unknown/new coins get conservative 15% allocation
-        assert_eq!(coin_max_alloc("XYZUSDT"), 0.15);
+        assert_eq!(coin_max_alloc(&test_ecfg(), "XYZUSDT"), 0.15);
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -1473,7 +1541,7 @@ mod tests {
     #[test]
     fn trail_inactive_before_tp1() {
         // half_exited=0 → trail must be 0.0 (TP1 not hit yet)
-        let ts = compute_trail_sl(0, 95.0, 80.0);
+        let ts = compute_trail_sl(0, 95.0, 80.0, 0.025);
         assert_eq!(ts, 0.0, "Trailing stop must be inactive before TP1");
     }
 
@@ -1481,16 +1549,16 @@ mod tests {
     fn trail_active_after_tp1() {
         // half_exited=1, high_water=100, entry=80
         // trail_sl = 100 * 0.975 = 97.5, and 97.5 > 80 → active
-        let ts = compute_trail_sl(1, 100.0, 80.0);
-        let expected = 100.0 * (1.0 - TRAIL_PCT);
+        let ts = compute_trail_sl(1, 100.0, 80.0, 0.025);
+        let expected = 100.0 * (1.0 - 0.025);
         assert!((ts - expected).abs() < 0.0001, "trail_sl={:.4} expected {:.4}", ts, expected);
     }
 
     #[test]
     fn trail_tracks_high_water() {
         // As price moves up, trail_sl rises with it
-        let ts_low  = compute_trail_sl(1, 90.0, 80.0);
-        let ts_high = compute_trail_sl(1, 110.0, 80.0);
+        let ts_low  = compute_trail_sl(1, 90.0, 80.0, 0.025);
+        let ts_high = compute_trail_sl(1, 110.0, 80.0, 0.025);
         assert!(ts_high > ts_low, "Higher high_water must produce higher trail_sl");
     }
 
@@ -1498,22 +1566,22 @@ mod tests {
     fn trail_zero_when_would_breach_entry() {
         // high_water barely above entry: trail_sl would be below entry → return 0
         // entry=100, high_water=100.1 → trail = 100.1 * 0.975 = 97.6 < entry(100) → 0.0
-        let ts = compute_trail_sl(1, 100.1, 100.0);
+        let ts = compute_trail_sl(1, 100.1, 100.0, 0.025);
         assert_eq!(ts, 0.0, "trail_sl below entry must be suppressed to 0.0");
     }
 
     #[test]
     fn trail_zero_when_high_water_equals_entry() {
         // high_water == entry → no gain yet, trail inactive
-        let ts = compute_trail_sl(1, 80.0, 80.0);
+        let ts = compute_trail_sl(1, 80.0, 80.0, 0.025);
         assert_eq!(ts, 0.0, "No trail when high_water == entry");
     }
 
     #[test]
     fn trail_preserves_2_5pct_gap() {
-        // TRAIL_PCT = 2.5% — trail_sl should always be exactly 2.5% below high_water
+        // 0.025 = 2.5% — trail_sl should always be exactly 2.5% below high_water
         let high_water = 150.0_f64;
-        let ts = compute_trail_sl(1, high_water, 100.0);
+        let ts = compute_trail_sl(1, high_water, 100.0, 0.025);
         let expected = high_water * 0.975;
         assert!((ts - expected).abs() < 0.0001,
             "trail_sl should be exactly 2.5% below high_water: got {:.4} expected {:.4}", ts, expected);
@@ -1629,7 +1697,7 @@ mod tests {
     fn corr_btc_blocks_eth() {
         let conn = make_test_db();
         insert_open(&conn, "BTCUSDT");
-        assert!(corr_group_blocked(&conn, "ETHUSDT"),
+        assert!(corr_group_blocked(&conn, "ETHUSDT", &test_ecfg()),
             "BTC open must block ETH (same group)");
     }
 
@@ -1637,7 +1705,7 @@ mod tests {
     fn corr_eth_blocks_btc() {
         let conn = make_test_db();
         insert_open(&conn, "ETHUSDT");
-        assert!(corr_group_blocked(&conn, "BTCUSDT"),
+        assert!(corr_group_blocked(&conn, "BTCUSDT", &test_ecfg()),
             "ETH open must block BTC (same group)");
     }
 
@@ -1645,7 +1713,7 @@ mod tests {
     fn corr_sol_blocks_bnb() {
         let conn = make_test_db();
         insert_open(&conn, "SOLUSDT");
-        assert!(corr_group_blocked(&conn, "BNBUSDT"),
+        assert!(corr_group_blocked(&conn, "BNBUSDT", &test_ecfg()),
             "SOL open must block BNB (same group)");
     }
 
@@ -1653,7 +1721,7 @@ mod tests {
     fn corr_bnb_blocks_ada() {
         let conn = make_test_db();
         insert_open(&conn, "BNBUSDT");
-        assert!(corr_group_blocked(&conn, "ADAUSDT"),
+        assert!(corr_group_blocked(&conn, "ADAUSDT", &test_ecfg()),
             "BNB open must block ADA (L1 alts group)");
     }
 
@@ -1661,7 +1729,7 @@ mod tests {
     fn corr_avax_blocks_apt() {
         let conn = make_test_db();
         insert_open(&conn, "AVAXUSDT");
-        assert!(corr_group_blocked(&conn, "APTUSDT"),
+        assert!(corr_group_blocked(&conn, "APTUSDT", &test_ecfg()),
             "AVAX open must block APT (L1/L2 beta group)");
     }
 
@@ -1669,7 +1737,7 @@ mod tests {
     fn corr_doge_blocks_ltc() {
         let conn = make_test_db();
         insert_open(&conn, "DOGEUSDT");
-        assert!(corr_group_blocked(&conn, "LTCUSDT"),
+        assert!(corr_group_blocked(&conn, "LTCUSDT", &test_ecfg()),
             "DOGE open must block LTC (legacy/meme group)");
     }
 
@@ -1678,14 +1746,14 @@ mod tests {
         // BTC (group1) and SOL (group2) are in different groups — should NOT block
         let conn = make_test_db();
         insert_open(&conn, "BTCUSDT");
-        assert!(!corr_group_blocked(&conn, "SOLUSDT"),
+        assert!(!corr_group_blocked(&conn, "SOLUSDT", &test_ecfg()),
             "BTC must NOT block SOL (different groups)");
     }
 
     #[test]
     fn corr_no_open_positions_not_blocked() {
         let conn = make_test_db();
-        assert!(!corr_group_blocked(&conn, "BTCUSDT"),
+        assert!(!corr_group_blocked(&conn, "BTCUSDT", &test_ecfg()),
             "No open positions → not blocked");
     }
 
@@ -1695,7 +1763,7 @@ mod tests {
         let conn = make_test_db();
         insert_open(&conn, "BTCUSDT");
         insert_open(&conn, "SOLUSDT");
-        assert!(!corr_group_blocked(&conn, "XYZUSDT"),
+        assert!(!corr_group_blocked(&conn, "XYZUSDT", &test_ecfg()),
             "Unknown symbol not in any group must not be blocked");
     }
 
@@ -1705,7 +1773,7 @@ mod tests {
         let conn = make_test_db();
         insert_open(&conn, "ETHUSDT");
         conn.execute("UPDATE open_positions SET status='CLOSED_TP2' WHERE symbol='ETHUSDT'", []).unwrap();
-        assert!(!corr_group_blocked(&conn, "BTCUSDT"),
+        assert!(!corr_group_blocked(&conn, "BTCUSDT", &test_ecfg()),
             "Closed ETH must not block BTC");
     }
 
@@ -1803,7 +1871,7 @@ mod tests {
     fn pump_high_vol_high_rsi_blocked() {
         let dir = tempfile::tempdir().unwrap();
         write_temp_cache(dir.path(), "SOLUSDT", 82.0, 5.0, 100.0, 90.0);
-        assert!(is_pump_or_exhausted("SOLUSDT", dir.path()),
+        assert!(is_pump_or_exhausted("SOLUSDT", dir.path(), &test_ecfg()),
             "vol=5 + rsi=82 must be flagged as pump");
     }
 
@@ -1813,7 +1881,7 @@ mod tests {
         // price=100, ema20=95 → price/ema20 = 1.053 (below 1.08 threshold) — not stretched
         // vol=5.0, rsi=60 → vol pump needs rsi>78 too — not triggered
         write_temp_cache(dir.path(), "SOLUSDT", 60.0, 5.0, 100.0, 95.0);
-        assert!(!is_pump_or_exhausted("SOLUSDT", dir.path()),
+        assert!(!is_pump_or_exhausted("SOLUSDT", dir.path(), &test_ecfg()),
             "vol=5 + rsi=60 + price not stretched — should not block");
     }
 
@@ -1822,7 +1890,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // price = 110, ema20 = 100 → 10% above EMA20 → stretched
         write_temp_cache(dir.path(), "SOLUSDT", 55.0, 1.5, 110.0, 100.0);
-        assert!(is_pump_or_exhausted("SOLUSDT", dir.path()),
+        assert!(is_pump_or_exhausted("SOLUSDT", dir.path(), &test_ecfg()),
             "Price 10% above EMA20 must be flagged as stretched");
     }
 
@@ -1831,7 +1899,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Normal: vol=1.5, rsi=65, price only 3% above ema20
         write_temp_cache(dir.path(), "SOLUSDT", 65.0, 1.5, 103.0, 100.0);
-        assert!(!is_pump_or_exhausted("SOLUSDT", dir.path()),
+        assert!(!is_pump_or_exhausted("SOLUSDT", dir.path(), &test_ecfg()),
             "Normal conditions must not block");
     }
 
@@ -1840,7 +1908,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_temp_cache(dir.path(), "SOLUSDT", 90.0, 8.0, 200.0, 100.0);
         // Ask about ETHUSDT — not in cache → should return false (safe default)
-        assert!(!is_pump_or_exhausted("ETHUSDT", dir.path()),
+        assert!(!is_pump_or_exhausted("ETHUSDT", dir.path(), &test_ecfg()),
             "Missing symbol in cache must not block (safe default)");
     }
 
@@ -1848,7 +1916,7 @@ mod tests {
     fn pump_no_cache_file_not_blocked() {
         // Cache file doesn't exist → default false (safe, don't block)
         let dir = tempfile::tempdir().unwrap();
-        assert!(!is_pump_or_exhausted("BTCUSDT", dir.path()),
+        assert!(!is_pump_or_exhausted("BTCUSDT", dir.path(), &test_ecfg()),
             "Missing cache file must not block");
     }
 
@@ -1859,36 +1927,36 @@ mod tests {
     #[test]
     fn coin_alloc_xrp_mid_cap_sol_group() {
         // XRP is in the mid-cap group (SOL/BNB/XRP) → 25%
-        assert_eq!(coin_max_alloc("XRPUSDT"), 0.25);
+        assert_eq!(coin_max_alloc(&test_ecfg(), "XRPUSDT"), 0.25);
     }
 
     #[test]
     fn coin_alloc_dot_link_established_alts() {
         // DOT, LINK → established alts → 20%
-        assert_eq!(coin_max_alloc("DOTUSDT"),  0.20);
-        assert_eq!(coin_max_alloc("LINKUSDT"), 0.20);
+        assert_eq!(coin_max_alloc(&test_ecfg(), "DOTUSDT"),  0.20);
+        assert_eq!(coin_max_alloc(&test_ecfg(), "LINKUSDT"), 0.20);
     }
 
     #[test]
     fn coin_alloc_doge_ltc_ada_established() {
         // DOGE, LTC, ADA → established alts → 20%
-        assert_eq!(coin_max_alloc("DOGEUSDT"), 0.20);
-        assert_eq!(coin_max_alloc("LTCUSDT"),  0.20);
-        assert_eq!(coin_max_alloc("ADAUSDT"),  0.20);
+        assert_eq!(coin_max_alloc(&test_ecfg(), "DOGEUSDT"), 0.20);
+        assert_eq!(coin_max_alloc(&test_ecfg(), "LTCUSDT"),  0.20);
+        assert_eq!(coin_max_alloc(&test_ecfg(), "ADAUSDT"),  0.20);
     }
 
     #[test]
     fn coin_alloc_avax_established_apt_highbeta() {
         // AVAX → established alt → 20%;  APT → high-beta → 15%
-        assert_eq!(coin_max_alloc("AVAXUSDT"), 0.20);
-        assert_eq!(coin_max_alloc("APTUSDT"),  0.15);
+        assert_eq!(coin_max_alloc(&test_ecfg(), "AVAXUSDT"), 0.20);
+        assert_eq!(coin_max_alloc(&test_ecfg(), "APTUSDT"),  0.15);
     }
 
     #[test]
     fn coin_alloc_highbeta_coins() {
         // FIL, SUI, ARB, OP, INJ → high-beta default → 15%
         for sym in &["FILUSDT", "SUIUSDT", "ARBUSDT", "OPUSDT", "INJUSDT"] {
-            assert_eq!(coin_max_alloc(sym), 0.15, "{} should be 15%", sym);
+            assert_eq!(coin_max_alloc(&test_ecfg(), sym), 0.15, "{} should be 15%", sym);
         }
     }
 
@@ -1943,7 +2011,7 @@ mod tests {
         // Tier C: base_risk*0.5, floored at 1%
         // base_risk=0.02 → tier_c = 0.01 → floor(0.01) = 0.01
         let s = sig(0.3, 0.55, 0.45, 0.5, 79.0, 76.5, 81.0);
-        let r = kelly_risk_fraction(&s, 0.02);
+        let r = kelly_risk_fraction(&s, 0.02, &test_ecfg());
         assert!((r - 0.01).abs() < 0.001, "Tier C with base 2% should be 1% (floor): {:.4}", r);
     }
 
@@ -1951,7 +2019,7 @@ mod tests {
     fn kelly_zero_base_risk_still_floored_at_1pct() {
         // Even with base_risk=0, result must be >= 1%
         let s = sig(0.5, 0.55, 0.45, 0.5, 79.0, 76.5, 81.0);
-        let r = kelly_risk_fraction(&s, 0.0);
+        let r = kelly_risk_fraction(&s, 0.0, &test_ecfg());
         assert!(r >= 0.01, "Kelly must never go below 1%: got {:.4}", r);
     }
 
@@ -1961,27 +2029,27 @@ mod tests {
 
     #[test]
     fn hold_btc_eth_120min() {
-        assert_eq!(max_hold_min("BTCUSDT"), 120);
-        assert_eq!(max_hold_min("ETHUSDT"), 120);
+        assert_eq!(max_hold_min(&test_ecfg(), "BTCUSDT"), 120);
+        assert_eq!(max_hold_min(&test_ecfg(), "ETHUSDT"), 120);
     }
 
     #[test]
     fn hold_mid_caps_90min() {
         for sym in &["SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","DOTUSDT","LINKUSDT","LTCUSDT","DOGEUSDT"] {
-            assert_eq!(max_hold_min(sym), 90, "{} should be 90min", sym);
+            assert_eq!(max_hold_min(&test_ecfg(), sym), 90, "{} should be 90min", sym);
         }
     }
 
     #[test]
     fn hold_highbeta_60min() {
         for sym in &["AVAXUSDT","APTUSDT","SUIUSDT","FILUSDT","ARBUSDT","OPUSDT","INJUSDT","NEARUSDT","UNIUSDT"] {
-            assert_eq!(max_hold_min(sym), 60, "{} should be 60min", sym);
+            assert_eq!(max_hold_min(&test_ecfg(), sym), 60, "{} should be 60min", sym);
         }
     }
 
     #[test]
     fn hold_unknown_symbol_defaults_60min() {
-        assert_eq!(max_hold_min("UNKNOWNUSDT"), 60);
+        assert_eq!(max_hold_min(&test_ecfg(), "UNKNOWNUSDT"), 60);
     }
 
     // ════════════════════════════════════════════════════════════════
