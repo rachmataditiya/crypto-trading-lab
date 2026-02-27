@@ -301,6 +301,32 @@ pub fn evaluate(
     // Spot-only / halal constraint: NEVER short. Long only.
     let direction = Direction::Long;
 
+    // ── Tier V late-entry guard ──────────────────────────────────────────────
+    // Volume breakouts (Tier V) are only worth entering EARLY — close to EMA20.
+    // If price has already run > 2.5% above EMA20 at signal time, the impulse is
+    // exhausted and reward/risk is unfavorable (entering too late in the candle).
+    // Tier A/B have multi-TF confirmation that justifies higher EMA20 deviation.
+    if effective_tier == 'V' && best.ema20 > 0.0 {
+        let pct_above_ema = (best.price - best.ema20) / best.ema20 * 100.0;
+        if pct_above_ema > 2.5 {
+            return no_trade(
+                hour_label,
+                regime,
+                watchlist_top3,
+                news_context,
+                format!("{} setup candidate [Tier V late]", best.symbol),
+                format!(
+                    "Tier V late entry blocked: {:.1}% above EMA20 (max 2.5%). \
+                     Volume impulse likely exhausted.",
+                    pct_above_ema
+                ),
+                format!("{};tier_v_late={:.1}%", quality_gate, pct_above_ema),
+                checklist,
+                Some(prob.clone()),
+            );
+        }
+    }
+
     let base_risk = if speculative_avax_mode {
         config.max_risk_per_trade_pct
     } else {

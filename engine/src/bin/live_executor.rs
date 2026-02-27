@@ -850,6 +850,22 @@ fn main() -> Result<()> {
                     }
                     "DYNAMIC" => {
                         let pct = (current - sig.entry) / sig.entry * 100.0;
+
+                        // Strict guard for low-risk/conservative-tier signals (Tier V/R).
+                        // Identified by risk_pct ≤ 1.2% (half-Kelly: 2% base × 0.5 = 1%).
+                        // These tiers have lower multi-TF confidence — do NOT chase past 5%.
+                        // For Tier V (volume breakout): entry must be fresh, not extended.
+                        let is_conservative_tier = sig.risk_pct <= 1.2;
+                        if is_conservative_tier && pct > 5.0 {
+                            println!("[executor] ⏩ Skip Tier V/R late chase — {:.1}% run (max 5% for half-Kelly tier)",
+                                     pct);
+                            mark_processed(&live_conn, sig_id, &sig.symbol, &sig.direction,
+                                           sig.entry, sig.stop, sig.tp1, "",
+                                           "SKIPPED_TIER_V_LATE", 0.0,
+                                           &format!("run={:.1}%>5%,conservative_tier", pct));
+                            continue;
+                        }
+
                         // Extra guard: if price ran >5% AND RSI already overbought (>75),
                         // skip — we'd be chasing an exhausted move after the meat is gone.
                         // Threshold: 5% run = halfway through the DYNAMIC window (3–10%).
