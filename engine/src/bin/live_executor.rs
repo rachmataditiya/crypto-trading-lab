@@ -352,6 +352,43 @@ fn is_pump_or_exhausted(symbol: &str, cache_path: &Path, ecfg: &ExecutorConfig) 
     vol_pump || stretched
 }
 
+/// Returns true if the coin's macro EMA trend is UP (bullish): price > EMA20 > EMA50.
+///
+/// Reads from realtime_cache (updated from confirmed 4H candles by realtime-engine).
+/// Gate purpose: prevent LONG entries during macro downtrends, even when a 1H bounce
+/// triggers an AMS Tier A/B signal. The 2026-02-27 session showed that DOT×2 and SOL×1
+/// were entered LONG while price < EMA20 < EMA50 — all three closed at a loss (CLOSED_TIME).
+///
+/// Fail-open on cache error: if cache is unreadable, allow entry (other guards remain active).
+/// Fail-open on zero EMA: OKX-reported EMA not yet warmed up — allow entry conservatively.
+fn macro_ema_aligned(symbol: &str, cache_path: &Path) -> bool {
+    let cache_file = cache_path.join("trading-journal/realtime_cache.json");
+    let text = match std::fs::read_to_string(&cache_file) { Ok(t) => t, Err(_) => return true };
+    let d: serde_json::Value = match serde_json::from_str(&text) { Ok(v) => v, Err(_) => return true };
+    let sym = &d["symbols"][symbol];
+    let price = sym["price"].as_f64().unwrap_or(0.0);
+    let ema20 = sym["ema20"].as_f64().unwrap_or(0.0);
+    let ema50 = sym["ema50"].as_f64().unwrap_or(0.0);
+    if ema20 <= 0.0 || ema50 <= 0.0 { return true; } // warm-up not done — allow
+    price > ema20 && ema20 > ema50
+}
+
+/// Returns how many CLOSED_TIME exits a symbol had today (UTC date).
+///
+/// CLOSED_TIME = executor's time-stop: price failed to reach TP within hold_min.
+/// Pattern on 2026-02-27: DOT had CLOSED_TIME at 12:48 WIB → re-entered at 16:21 WIB
+/// (after 120-min cooldown expired) → CLOSED_TIME again at 17:51 WIB → -$0.16 more.
+/// Fix: after 1 CLOSED_TIME on a coin today, block re-entry until the next day.
+/// The setup is exhausted for that session — the H4 candle context has not changed.
+fn daily_closed_time_count(conn: &Connection, symbol: &str, today: &str) -> u32 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM open_positions \
+         WHERE symbol=? AND status='CLOSED_TIME' AND date(closed_at)=?",
+        rusqlite::params![symbol, today],
+        |r| r.get::<_, u32>(0),
+    ).unwrap_or(0)
+}
+
 fn place_market_buy(client: &Client, cfg: &Config, inst: &str, usdt_amount: f64) -> Result<String> {
     let body = json!({"instId":inst,"tdMode":"cash","side":"buy","ordType":"market",
                       "sz":format!("{:.2}",usdt_amount),"tgtCcy":"quote_ccy"});
@@ -899,6 +936,30 @@ fn main() -> Result<()> {
                 if is_pump_or_exhausted(&sig.symbol, &base.join("../.."), &ecfg) {
                     println!("[executor] 🚨 Pump/dump detected for {} — skipping entry", sig.symbol);
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_PUMP_DUMP",0.0,"vol>4×+RSI>78 or price>EMA20×1.08");
+                    continue;
+                }
+
+                // ── Macro EMA alignment guard ─────────────────────────────────────────
+                // Block LONG entry if price < EMA20 or EMA20 < EMA50 (macro bearish stack).
+                // Root cause of 2026-02-27 losses: DOT×2 + SOL×1 entered against macro trend.
+                // Realtime cache uses confirmed 4H candles — reliable macro trend indicator.
+                if !macro_ema_aligned(&sig.symbol, &base.join("../..")) {
+                    println!("[executor] ⛔ Macro EMA DOWN: {} — skip LONG in downtrend", sig.symbol);
+                    mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_EMA_DOWN",0.0,
+                        "price<ema20 or ema20<ema50 (4H macro bearish)");
+                    continue;
+                }
+
+                // ── Daily CLOSED_TIME re-entry guard ─────────────────────────────────
+                // After 1 CLOSED_TIME on a coin today, block re-entry for the rest of the day.
+                // The setup is exhausted: price couldn't reach TP within hold_min, and
+                // the H4 candle context hasn't changed. Re-entry compounds the loss.
+                // Root cause: DOT CLOSED_TIME at 12:48 WIB, re-entered at 16:21 WIB after
+                // 120-min cooldown → CLOSED_TIME again at 17:51 WIB → unnecessary -$0.16.
+                if daily_closed_time_count(&live_conn, &sig.symbol, &today) >= 1 {
+                    println!("[executor] 🚫 {} already had CLOSED_TIME today — no same-day re-entry", sig.symbol);
+                    mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_DAILY_TIME_EXIT",0.0,
+                        "CLOSED_TIME already logged today for this coin");
                     continue;
                 }
 
@@ -2303,5 +2364,163 @@ mod tests {
         // max_losses=0: any loss (even 0 consec) → blocked since 0 < 0 is false
         assert!(!is_risk_ok(false, 0, 0.0, 0, 0.10),
             "max_losses=0 means never trade (blocked even at 0 losses)");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 20. MACRO EMA ALIGNMENT GUARD
+    // Root cause of 2026-02-27 losses: DOT×2 + SOL×1 entered LONG while
+    // price < EMA20 < EMA50 (macro bearish stack). New guard blocks these.
+    // ════════════════════════════════════════════════════════════════
+
+    fn write_cache_with_emas(dir: &tempfile::TempDir, symbol: &str, price: f64, ema20: f64, ema50: f64) {
+        std::fs::create_dir_all(dir.path().join("trading-journal")).unwrap();
+        let content = format!(
+            r#"{{"generated_at":"2026-02-27T10:00:00+00:00","symbols":{{"{}":{{"price":{},"ema20":{},"ema50":{},"rsi14":55,"volume_ratio":2.0}}}}}}"#,
+            symbol, price, ema20, ema50
+        );
+        std::fs::write(dir.path().join("trading-journal/realtime_cache.json"), content).unwrap();
+    }
+
+    #[test]
+    fn macro_ema_aligned_bull_stack_allowed() {
+        // price=100 > ema20=95 > ema50=88 → bull stack → allow entry
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_with_emas(&dir, "SOLUSDT", 100.0, 95.0, 88.0);
+        assert!(macro_ema_aligned("SOLUSDT", dir.path()),
+            "Bull stack (price>EMA20>EMA50) must be allowed");
+    }
+
+    #[test]
+    fn macro_ema_aligned_price_below_ema20_blocked() {
+        // price=82 < ema20=87 < ema50=92 → full bear stack → block
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_with_emas(&dir, "SOLUSDT", 82.0, 87.0, 92.0);
+        assert!(!macro_ema_aligned("SOLUSDT", dir.path()),
+            "Bear stack (price<EMA20<EMA50) must be blocked — 2026-02-27 SOL pattern");
+    }
+
+    #[test]
+    fn macro_ema_aligned_ema20_below_ema50_blocked() {
+        // price=90 > ema20=88 but ema20<ema50=92 → death cross → block
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_with_emas(&dir, "SOLUSDT", 90.0, 88.0, 92.0);
+        assert!(!macro_ema_aligned("SOLUSDT", dir.path()),
+            "Death cross (EMA20<EMA50) must be blocked even if price>EMA20");
+    }
+
+    #[test]
+    fn macro_ema_aligned_missing_symbol_allowed() {
+        // Symbol not in cache → default 0.0 → zero EMA → fail-open (allow)
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_with_emas(&dir, "BTCUSDT", 100.0, 95.0, 88.0);
+        assert!(macro_ema_aligned("XRPUSDT", dir.path()),
+            "Missing symbol in cache must fail-open (allow)");
+    }
+
+    #[test]
+    fn macro_ema_aligned_no_cache_file_allowed() {
+        // Cache file doesn't exist → fail-open (allow) — other guards still active
+        let dir = tempfile::tempdir().unwrap();
+        assert!(macro_ema_aligned("SOLUSDT", dir.path()),
+            "Missing cache file must fail-open (allow)");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 21. DAILY CLOSED_TIME RE-ENTRY GUARD
+    // After 1 CLOSED_TIME on a coin today, block same-day re-entry.
+    // Root cause: DOT re-entered 3.5h after first CLOSED_TIME → -$0.16 loss.
+    // ════════════════════════════════════════════════════════════════
+
+    fn init_test_live_db_for_closed_time() -> (rusqlite::Connection, String) {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("
+            CREATE TABLE open_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id INTEGER,
+                order_id TEXT,
+                symbol TEXT,
+                direction TEXT,
+                qty REAL,
+                entry_price REAL,
+                stop_price REAL,
+                tp1_price REAL,
+                tp2_price REAL,
+                risk_usdt REAL,
+                opened_at TEXT,
+                status TEXT DEFAULT 'OPEN',
+                half_exited INTEGER DEFAULT 0,
+                p_up REAL,
+                high_water REAL DEFAULT 0,
+                closed_at TEXT
+            );
+        ").unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        (conn, today)
+    }
+
+    #[test]
+    fn daily_closed_time_zero_on_no_history() {
+        let (conn, today) = init_test_live_db_for_closed_time();
+        assert_eq!(daily_closed_time_count(&conn, "DOTUSDT", &today), 0,
+            "No history → 0 CLOSED_TIME count");
+    }
+
+    #[test]
+    fn daily_closed_time_counts_todays_time_exit() {
+        let (conn, today) = init_test_live_db_for_closed_time();
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.f+00:00").to_string();
+        conn.execute(
+            "INSERT INTO open_positions(symbol,direction,qty,entry_price,stop_price,tp1_price,risk_usdt,opened_at,status,closed_at) \
+             VALUES ('DOTUSDT','Long',14.9,1.612,1.482,1.806,4.8,?1,'CLOSED_TIME',?1)",
+            rusqlite::params![&now],
+        ).unwrap();
+        assert_eq!(daily_closed_time_count(&conn, "DOTUSDT", &today), 1,
+            "1 CLOSED_TIME today → count must be 1");
+    }
+
+    #[test]
+    fn daily_closed_time_does_not_count_other_statuses() {
+        let (conn, today) = init_test_live_db_for_closed_time();
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.f+00:00").to_string();
+        // Insert CLOSED_SL and CLOSED_TP — should NOT count as CLOSED_TIME
+        for status in &["CLOSED_SL", "CLOSED_TP", "CLOSED_TP2", "CLOSED_MANUAL"] {
+            conn.execute(
+                "INSERT INTO open_positions(symbol,direction,qty,entry_price,stop_price,tp1_price,risk_usdt,opened_at,status,closed_at) \
+                 VALUES ('DOTUSDT','Long',14.9,1.612,1.482,1.806,4.8,?1,?2,?1)",
+                rusqlite::params![&now, status],
+            ).unwrap();
+        }
+        assert_eq!(daily_closed_time_count(&conn, "DOTUSDT", &today), 0,
+            "SL/TP/TP2/MANUAL closes must not count as CLOSED_TIME");
+    }
+
+    #[test]
+    fn daily_closed_time_does_not_count_other_symbols() {
+        let (conn, today) = init_test_live_db_for_closed_time();
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.f+00:00").to_string();
+        // DOT has CLOSED_TIME, but we query SOL
+        conn.execute(
+            "INSERT INTO open_positions(symbol,direction,qty,entry_price,stop_price,tp1_price,risk_usdt,opened_at,status,closed_at) \
+             VALUES ('DOTUSDT','Long',14.9,1.612,1.482,1.806,4.8,?1,'CLOSED_TIME',?1)",
+            rusqlite::params![&now],
+        ).unwrap();
+        assert_eq!(daily_closed_time_count(&conn, "SOLUSDT", &today), 0,
+            "DOT CLOSED_TIME must not count for SOL query");
+    }
+
+    #[test]
+    fn daily_closed_time_double_exit_counts_two() {
+        let (conn, today) = init_test_live_db_for_closed_time();
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.f+00:00").to_string();
+        // DOT had 2 CLOSED_TIME today — exact 2026-02-27 pattern
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO open_positions(symbol,direction,qty,entry_price,stop_price,tp1_price,risk_usdt,opened_at,status,closed_at) \
+                 VALUES ('DOTUSDT','Long',14.9,1.612,1.482,1.806,4.8,?1,'CLOSED_TIME',?1)",
+                rusqlite::params![&now],
+            ).unwrap();
+        }
+        assert_eq!(daily_closed_time_count(&conn, "DOTUSDT", &today), 2,
+            "2 CLOSED_TIME exits today → count must be 2 (re-entry blocked)");
     }
 }

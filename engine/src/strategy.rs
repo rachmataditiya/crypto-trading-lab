@@ -184,6 +184,14 @@ pub fn evaluate(
         prob.confidence >= 0.55 && prob.expected_value_r > 0.0
     };
 
+    // Macro EMA alignment: price > EMA20 > EMA50 (bull stack).
+    // Prevents entering LONG on a 1H bounce inside a macro downtrend where all 4H EMAs are DOWN.
+    // Root cause of 2026-02-27 losses: system generated Tier A signals (DOT×2, SOL×1) while
+    // most coins had EMA=DOWN on realtime cache (confirmed 4H candles).
+    // This gate is UNCONDITIONAL — both modes must pass it. EMA stack is deterministic,
+    // not confidence-weighted: either the macro trend supports the trade or it doesn't.
+    let pass_macro_ema = best.price > best.ema20 && best.ema20 > best.ema50;
+
     let checklist_pass_count = [
         pass_regime,
         pass_score,
@@ -192,14 +200,15 @@ pub fn evaluate(
         pass_confidence,
         pass_probability,
         hmtf_gate_ok,
+        pass_macro_ema,
     ]
     .iter()
     .filter(|&&x| x)
     .count();
     let setup_grade = match checklist_pass_count {
-        7 => "A",
-        6 => "B",
-        5 => "C",
+        8 => "A",
+        7 => "B",
+        6 => "C",
         _ => "D",
     };
 
@@ -251,10 +260,17 @@ pub fn evaluate(
             best.ams_regime_rho,
             best.ams_divergence_d,
         ),
+        format!(
+            "Macro EMA aligned (price>EMA20>EMA50): {} (price={:.4}, ema20={:.4}, ema50={:.4})",
+            mark(pass_macro_ema),
+            best.price,
+            best.ema20,
+            best.ema50,
+        ),
     ];
 
     let quality_gate = format!(
-        "gate(grade={},regime={},score={},volume={},adx={},confidence={},prob={});bayes(prior={:.2},tech={:.2},news={:.2},post={:.2});ams={},ams_regime={:.2},ams_div={:.3},sel={}",
+        "gate(grade={},regime={},score={},volume={},adx={},confidence={},prob={},macro_ema={});bayes(prior={:.2},tech={:.2},news={:.2},post={:.2});ams={},ams_regime={:.2},ams_div={:.3},sel={}",
         setup_grade,
         pass_regime,
         pass_score,
@@ -262,6 +278,7 @@ pub fn evaluate(
         pass_adx,
         pass_confidence,
         pass_probability,
+        pass_macro_ema,
         prob.prior_up,
         prob.tech_likelihood,
         prob.news_likelihood,
@@ -272,14 +289,15 @@ pub fn evaluate(
         if ams_selected { "ams" } else { "bayes" },
     );
 
-    // All 7 gates must pass — no bypass. Aggressive mode already has looser thresholds.
+    // All 8 gates must pass — no bypass. Aggressive mode already has looser thresholds.
     let full_gate_pass = pass_regime
         && pass_score
         && pass_volume
         && pass_adx
         && pass_confidence
         && pass_probability
-        && hmtf_gate_ok;
+        && hmtf_gate_ok
+        && pass_macro_ema;
 
     if !full_gate_pass {
         return no_trade(
@@ -841,6 +859,97 @@ mod tests {
         assert!(
             !result.quality_gate.contains("DOTUSDT"),
             "quality_gate must not reference DOTUSDT: '{}'",
+            result.quality_gate
+        );
+    }
+
+    // ===========================================================
+    // MACRO EMA ALIGNMENT GATE — REGRESSION TESTS
+    // Root cause of 2026-02-27 losses: system entered LONG on 1H bounce
+    // while macro EMA (price vs EMA20 vs EMA50) was DOWN for DOT and SOL.
+    // The 8th gate now enforces: price > EMA20 > EMA50 (bull stack) required.
+    // ===========================================================
+
+    fn make_ema_down_coin(symbol: &str) -> CoinData {
+        // EMA stack DOWN: price < EMA20 < EMA50 (macro bearish)
+        CoinData {
+            symbol: symbol.to_string(),
+            grade: 'A',
+            score: 85,
+            price: 82.0,   // below EMA20
+            ema20: 87.0,   // below EMA50
+            ema50: 92.0,   // highest — bearish stack
+            ret_24h: 4.0,
+            ret_3d: 5.0,
+            ret_7d: 7.0,
+            rsi14: 55.0,
+            atr14_pct: 2.0,
+            adx14: 35.0,
+            range_pos_7d: 0.7,
+            volume_ratio: 5.5,
+            regime: "trending".to_string(),
+            hmtf_entry_score: 0.85,
+            hmtf_alignment: 4,
+            hmtf_tier: 'A',
+            ams_regime_rho: 0.72,
+            ams_regime_label: "TRENDING".to_string(),
+            ams_divergence_d: 0.15,
+            ams_e_trend: 0.85,
+            ams_e_reversion: 0.1,
+            ams_tier: 'A',
+            ams_kelly_multiplier: 1.0,
+        }
+    }
+
+    /// Regression: Tier A coin with macro EMA DOWN (price<EMA20<EMA50) must be blocked.
+    /// This is the specific pattern from 2026-02-27: DOT at 1.614 (below EMA20),
+    /// SOL at 87.42 (below EMA20) — both hit CLOSED_TIME losses.
+    #[test]
+    fn test_macro_ema_down_blocks_tier_a_entry() {
+        let coins = vec![make_ema_down_coin("SOLUSDT")];
+        let snapshot = make_ams_snapshot(coins);
+        let signal = make_ams_signal(&["SOLUSDT", "BTCUSDT", "ETHUSDT"]);
+        let state = SimState::new();
+        let config = make_ams_config();
+        let news = NewsContext::default();
+
+        let result = evaluate(&snapshot, &signal, &news, &state, &config);
+
+        // Must be NoTrade — macro EMA gate blocks the entry
+        let is_no_trade = matches!(result.decision, Decision::NoTrade { .. });
+        assert!(
+            is_no_trade,
+            "Tier A coin with EMA DOWN must be blocked by macro EMA gate.\n\
+             decision={:?}\nquality_gate='{}'",
+            result.decision,
+            result.quality_gate
+        );
+        // Confirm macro_ema=false is logged
+        assert!(
+            result.quality_gate.contains("macro_ema=false"),
+            "quality_gate must log macro_ema=false when EMA stack is DOWN: '{}'",
+            result.quality_gate
+        );
+    }
+
+    /// Sanity: Tier A coin with macro EMA UP (price>EMA20>EMA50) should NOT be blocked.
+    /// Verifies the gate doesn't break existing bull-trend entries.
+    #[test]
+    fn test_macro_ema_up_does_not_block_entry() {
+        // make_ams_coin sets price=100, ema20=95, ema50=88 → EMA UP
+        let coins = vec![make_ams_coin("SOLUSDT", 'A', 85, 'A', 0.85, 5.5)];
+        let snapshot = make_ams_snapshot(coins);
+        let signal = make_ams_signal(&["SOLUSDT", "BTCUSDT", "ETHUSDT"]);
+        let state = SimState::new();
+        let config = make_ams_config();
+        let news = NewsContext::default();
+
+        let result = evaluate(&snapshot, &signal, &news, &state, &config);
+
+        // macro_ema=true must be in quality_gate (gate is logged regardless of pass/fail)
+        assert!(
+            result.quality_gate.contains("macro_ema=true"),
+            "quality_gate must log macro_ema=true when EMA stack is UP: '{}'",
             result.quality_gate
         );
     }

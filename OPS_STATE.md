@@ -1,6 +1,6 @@
 # Crypto Trading Lab — Ops State (Persistent Snapshot)
 
-Last updated: 2026-02-27 11:30 WIB (Asia/Jakarta)
+Last updated: 2026-02-27 13:35 WIB (Asia/Jakarta)
 
 ---
 
@@ -117,6 +117,7 @@ live-executor (every 60s)
 | `journal_closed` wrong label for TP2/Trail/Breakeven | Fixed — all 7 exit types now have correct label + specific lesson learned |
 | `is_risk_ok` not testable (inline) | Extracted as pure function — 10 unit tests added |
 | Time-stop hardcoded 60min semua coin | Per-coin `max_hold_min()`: BTC/ETH=120min, mid-cap=90min, high-beta=60min |
+| AMS Tier B coin never selected (DOT Tier B filtered before AMS check) | `strategy.rs` two-pass: filter ALL coins for AMS Tier A/B/R first → sort by `hmtf_entry_score` → Bayesian top-3 fallback if none qualified. `sel=ams/bayes` logged in quality_gate. 3 regression tests added. |
 
 ---
 
@@ -145,9 +146,11 @@ live-executor (every 60s)
 | 20 | `compute_sl_tp_from_fill` edge cases | 3 |
 | 21 | Kelly tier C + zero base | 2 |
 | 22 | Circuit breaker (`is_risk_ok`) | 10 |
-| **Total live-executor** | | **101 passing** |
+| **Total live-executor** | | **108 passing** |
 | realtime (confirmed_close + push_close) | 9 |
-| **Grand total** | | **138 passing, 0 warnings** |
+| sim-engine lib (strategy, hmtf, ams_tracker, etc.) | 90 |
+| strategy AMS-first regression | 3 |
+| **Grand total** | | **198 passing, 0 warnings** |
 
 ---
 
