@@ -314,9 +314,12 @@ pub fn evaluate(
     };
     let atr_value = best.price * (best.atr14_pct / 100.0);
     // Tier R/V: conservative EV (win_rate=0.45, reward=1.2R)
-    // Tier V is a 1H volume breakout — lower multi-TF confidence → same treatment as R
+    // Tier V is a 1H volume breakout — lower multi-TF confidence → same treatment as R.
+    // min_expected_r check uses 1.0 floor for R/V (half Kelly already accounts for risk;
+    // applying the full A/B min_expected_r threshold would always block them).
     let expected_r = if matches!(effective_tier, 'R' | 'V') { 1.2 } else { 2.0 };
-    if expected_r < config.min_expected_r {
+    let min_er = if matches!(effective_tier, 'R' | 'V') { 1.0 } else { config.min_expected_r };
+    if expected_r < min_er {
         return no_trade(
             hour_label,
             regime,
@@ -325,7 +328,7 @@ pub fn evaluate(
             format!("{} setup candidate [{}]", best.symbol, setup_grade),
             format!(
                 "Expected R ({:.1}) below minimum ({:.1}).",
-                expected_r, config.min_expected_r
+                expected_r, min_er
             ),
             format!("{};expected_r={:.1}", quality_gate, expected_r),
             checklist,
