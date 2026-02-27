@@ -164,7 +164,11 @@ Exponentially weighted win-rate per mode ($\lambda = 0.94$, half-life $\approx 1
 
 $$\hat{W}(t) = \lambda\,\hat{W}(t-1) + (1-\lambda)\cdot\mathbf{1}[\text{win}_t]$$
 
-$$C_{\text{recent}} = \text{clamp}\!\left(\frac{\hat{W}}{W^*},\;0.5,\;1.5\right), \quad W^*_{\text{trend}}=0.60,\quad W^*_{\text{rev}}=0.45$$
+$$
+C_{\text{recent}}=\operatorname{clamp}\!\left(\frac{\hat{W}}{W^*},\,0.5,\,1.5\right),\quad
+W^*_{\text{trend}}=0.60,\quad
+W^*_{\text{rev}}=0.45
+$$
 
 $$\boxed{f_{\text{final}} = f_{\text{Kelly}} \cdot m_{\text{tier}} \cdot C_{\text{recent}}}$$
 
