@@ -204,6 +204,25 @@ fn get_equity(client: &Client, cfg: &Config) -> Result<f64> {
     Ok(r["data"][0]["totalEq"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0))
 }
 
+/// Query OKX fills history to find the most recent sell fill for an instrument.
+/// Used by ghost detection to get the actual exit price (not just current price estimate).
+/// Returns (fill_price, fill_time_rfc3339) or None if no recent fill found.
+fn get_last_sell_fill(client: &Client, cfg: &Config, inst: &str) -> Option<(f64, String)> {
+    let url = format!("/api/v5/trade/fills-history?instId={}&side=sell&limit=5", inst);
+    let r = okx_get(client, cfg, &url).ok()?;
+    let fills = r["data"].as_array()?;
+    // Most recent fill is first. Return the most recent sell fill price.
+    for fill in fills {
+        let px_str = fill["fillPx"].as_str().unwrap_or("0");
+        let px: f64 = px_str.parse().unwrap_or(0.0);
+        if px > 0.0 {
+            let ts = fill["ts"].as_str().unwrap_or("").to_string();
+            return Some((px, ts));
+        }
+    }
+    None
+}
+
 fn get_avail_usdt(client: &Client, cfg: &Config) -> Result<f64> {
     let r = okx_get(client, cfg, "/api/v5/account/balance")?;
     if let Some(details) = r["data"][0]["details"].as_array() {
@@ -971,9 +990,16 @@ fn main() -> Result<()> {
                 let ccy = symbol.replace("USDT", "");
                 let avail = get_avail_coin(&client, &cfg, &ccy);
                 if qty_floor(avail) == 0.0 && avail < 0.001 {
-                    let ghost_pnl = (current - entry) * qty;
-                    println!("[executor] 👻 Ghost position {} — avail={:.6} (dust), hold={}min, \
-                              est PnL={:.4}U. Auto-closing DB.", symbol, avail, hold_min, ghost_pnl);
+                    // Try to get actual exit price from OKX fills history
+                    // (covers: algo SL executed by OKX, manual close, liquidation)
+                    let (exit_price, fill_note) = match get_last_sell_fill(&client, &cfg, &inst) {
+                        Some((fp, _)) if fp > 0.0 => (fp, format!("okx_fill@{:.4}", fp)),
+                        _ => (current, format!("est@{:.4}", current)),
+                    };
+                    let ghost_pnl = (exit_price - entry) * qty;
+                    println!("[executor] 👻 Ghost {} — avail={:.6}(dust), hold={}min, \
+                              exit={} pnl={:.4}U. Likely OKX algo SL or manual close.",
+                              symbol, avail, hold_min, fill_note, ghost_pnl);
                     let closed_now = chrono::Utc::now().to_rfc3339();
                     live_conn.execute(
                         "UPDATE open_positions SET status='CLOSED_GHOST', closed_at=? WHERE id=?",
@@ -1077,9 +1103,17 @@ fn main() -> Result<()> {
 
             if closed {
                 let closed_now = chrono::Utc::now().to_rfc3339();
-                live_conn.execute("UPDATE open_positions SET status=?, closed_at=? WHERE id=?", params![status,closed_now,pid]).ok();
-                live_conn.execute("UPDATE processed_signals SET status=?,pnl_usdt=? WHERE signal_id=?",
-                    params![status,pnl,sig_id]).ok();
+                // Use explicit error logging (not .ok()) so DB update failures are visible
+                if let Err(e) = live_conn.execute(
+                    "UPDATE open_positions SET status=?, closed_at=? WHERE id=?",
+                    params![status, closed_now, pid]) {
+                    eprintln!("[executor] ❌ DB update failed (open_positions id={}): {}", pid, e);
+                }
+                if let Err(e) = live_conn.execute(
+                    "UPDATE processed_signals SET status=?,pnl_usdt=? WHERE signal_id=?",
+                    params![status, pnl, sig_id]) {
+                    eprintln!("[executor] ❌ DB update failed (processed_signals id={}): {}", sig_id, e);
+                }
                 let is_loss: i64 = if pnl < 0.0 { 1 } else { 0 };
                 live_conn.execute(
                     "UPDATE daily_stats SET realized_pnl=realized_pnl+?,
