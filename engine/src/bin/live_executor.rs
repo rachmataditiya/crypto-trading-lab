@@ -328,6 +328,15 @@ fn is_noisy_window() -> bool {
 
 /// Pump/dump protection — reads RSI, volume_ratio, and price vs EMA20 from the realtime cache.
 /// Returns true (= block entry) if pattern suggests active manipulation or exhaustion.
+/// Read RSI14 for a symbol from the realtime cache.
+/// Returns 50.0 (neutral) if cache is unavailable.
+fn get_rsi_from_cache(symbol: &str, cache_path: &Path) -> f64 {
+    let cache_file = cache_path.join("trading-journal/realtime_cache.json");
+    let text = match std::fs::read_to_string(&cache_file) { Ok(t) => t, Err(_) => return 50.0 };
+    let d: serde_json::Value = match serde_json::from_str(&text) { Ok(v) => v, Err(_) => return 50.0 };
+    d["symbols"][symbol]["rsi14"].as_f64().unwrap_or(50.0)
+}
+
 fn is_pump_or_exhausted(symbol: &str, cache_path: &Path, ecfg: &ExecutorConfig) -> bool {
     let cache_file = cache_path.join("trading-journal/realtime_cache.json");
     let text = match std::fs::read_to_string(&cache_file) { Ok(t) => t, Err(_) => return false };
@@ -841,6 +850,22 @@ fn main() -> Result<()> {
                     }
                     "DYNAMIC" => {
                         let pct = (current - sig.entry) / sig.entry * 100.0;
+                        // Extra guard: if price ran >5% AND RSI already overbought (>75),
+                        // skip — we'd be chasing an exhausted move after the meat is gone.
+                        // Threshold: 5% run = halfway through the DYNAMIC window (3–10%).
+                        // RSI > 75 = overbought zone, momentum likely to stall or reverse.
+                        if pct > 5.0 {
+                            let rsi = get_rsi_from_cache(&sig.symbol, &base.join("../.."));
+                            if rsi > 75.0 {
+                                println!("[executor] ⏩ Skip overbought run — {:.1}% run + RSI={:.0} > 75",
+                                         pct, rsi);
+                                mark_processed(&live_conn, sig_id, &sig.symbol, &sig.direction,
+                                               sig.entry, sig.stop, sig.tp1, "",
+                                               "SKIPPED_OVERBOUGHT_RUN", 0.0,
+                                               &format!("run={:.1}%,rsi={:.0}>75", pct, rsi));
+                                continue;
+                            }
+                        }
                         println!("[executor] 📈 Dynamic entry: price ran {:.1}% — recalculating SL/TP from fill", pct);
                     }
                     _ => {} // NORMAL
@@ -987,14 +1012,20 @@ fn main() -> Result<()> {
             // (algo order, manual, OKX liquidation) but DB was never updated.
             // Auto-close immediately instead of retrying indefinitely.
             //
-            // IMPORTANT: Skip ghost detection for freshly-opened positions (<10 min).
-            // OKX locks the coin balance when a SL algo order is active, making avail≈0
-            // even though the position is live. A genuine ghost only occurs after the
-            // position has had time to be monitored (avail stays dust across multiple cycles).
+            // Key distinction:
+            // - Legitimate position with active SL algo: OKX locks coin → avail ≈ dust
+            // - True ghost (externally sold): no algo active, coin gone → avail ≈ dust
+            // Fix: only trigger ghost if avail is dust AND no pending algo orders exist.
+            // Pending algo = OKX is still managing the position → NOT a ghost.
             {
                 let ccy = symbol.replace("USDT", "");
                 let avail = get_avail_coin(&client, &cfg, &ccy);
-                if qty_floor(avail) == 0.0 && avail < 0.001 && hold_min >= 10 {
+                let algo_url = format!("/api/v5/trade/orders-algo-pending?instId={}&ordType=conditional", inst);
+                let has_algo = okx_get(&client, &cfg, &algo_url)
+                    .ok()
+                    .and_then(|v| v["data"].as_array().map(|a| !a.is_empty()))
+                    .unwrap_or(false);
+                if qty_floor(avail) == 0.0 && avail < 0.001 && !has_algo {
                     // Try to get actual exit price from OKX fills history
                     // (covers: algo SL executed by OKX, manual close, liquidation)
                     let (exit_price, fill_note) = match get_last_sell_fill(&client, &cfg, &inst) {
@@ -1002,8 +1033,8 @@ fn main() -> Result<()> {
                         _ => (current, format!("est@{:.4}", current)),
                     };
                     let ghost_pnl = (exit_price - entry) * qty;
-                    println!("[executor] 👻 Ghost {} — avail={:.6}(dust), hold={}min, \
-                              exit={} pnl={:.4}U. Likely OKX algo SL or manual close.",
+                    println!("[executor] 👻 Ghost {} — avail={:.6}(dust), no_algo=true, hold={}min, \
+                              exit={} pnl={:.4}U. Position closed externally (algo SL or manual).",
                               symbol, avail, hold_min, fill_note, ghost_pnl);
                     let closed_now = chrono::Utc::now().to_rfc3339();
                     live_conn.execute(
