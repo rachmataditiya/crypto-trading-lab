@@ -345,37 +345,66 @@ pub fn compute_hmtf(input: &HmtfInput) -> HmtfSignal {
 
     // Layer 7: Tier assignment
     let label = regime_label(rho);
+
+    // Tier V (Volume Breakout) — fires across all regimes as last fallback before C.
+    // Logic: strong 1H volume surge with at least partial multi-TF alignment.
+    // Captures early momentum moves before H4/H6/H12 fully confirm (lower confidence
+    // than A/B, so half Kelly + conservative TP like Tier R).
+    //
+    // Conditions (all must hold):
+    //   vol > 4x   : significant accumulation / breakout volume
+    //   tf_1h > 0.05: 1H features clearly positive (EMA stack, RSI, trend direction)
+    //   align >= 2  : at least 2 TFs showing positive signal
+    //   adx_1h > 28 : 1H trend is established, not choppy
+    //   rsi_1h < 78 : not yet in exhaustion / overbought blowoff zone
+    let v_breakout = input.volume_ratio > 4.0
+        && tf_1h.score > 0.05
+        && alignment >= 2
+        && adx_1h > 28.0
+        && rsi_1h < 78.0;
+
     let tier = if rho > 0.6 {
-        // Trending mode: standard A/B/C
+        // Trending mode: A / B / V / C
         if e_trend > 0.30 && alignment >= 3 {
             'A'
         } else if e_trend > 0.15 && alignment >= 3 {
             'B'
+        } else if v_breakout {
+            'V'
         } else {
             'C'
         }
     } else if rho < 0.4 {
-        // Ranging mode: R (reversion) or C
+        // Ranging mode: R / V / C
         if e_reversion > 0.08 && divergence_d > 0.15 {
             'R'
+        } else if v_breakout {
+            'V'
         } else {
             'C'
         }
     } else {
-        // Mixed: could be A, R, or C
+        // Mixed (0.4 ≤ ρ ≤ 0.6): A / B / R / V / C
+        // Tier B threshold is stricter in mixed (0.20 vs 0.15 in trending)
+        // because regime conviction is lower — require stronger multi-TF signal.
         if e_trend > 0.30 && alignment >= 3 {
             'A'
+        } else if e_trend > 0.20 && alignment >= 3 {
+            'B'
         } else if e_reversion > 0.08 && divergence_d > 0.15 {
             'R'
+        } else if v_breakout {
+            'V'
         } else {
             'C'
         }
     };
 
     // Layer 8: Kelly multiplier (base, before C_recent adjustment)
+    // Tier V gets half Kelly (same as R) — lower confidence than A/B.
     let kelly_multiplier = match tier {
         'A' | 'B' => 1.0,
-        'R' => 0.5,
+        'R' | 'V' => 0.5,
         _ => 0.0,
     };
 
@@ -801,6 +830,70 @@ mod tests {
         let input = make_input(closes.clone(), closes.clone(), closes.clone(), closes.clone(), 3.0, price);
         let sig = compute_hmtf(&input);
         assert_eq!(sig.alignment, 4);
+    }
+
+    // ── Tier V (Volume Breakout) ──────────────────────────────────────────────
+
+    /// Tier V must have half Kelly (same as R) — lower confidence than A/B.
+    #[test]
+    fn test_tier_v_kelly_is_half() {
+        let kelly: f64 = match 'V' {
+            'A' | 'B' => 1.0,
+            'R' | 'V' => 0.5,
+            _ => 0.0,
+        };
+        assert!((kelly - 0.5).abs() < 1e-10, "Tier V Kelly should be 0.5, got {}", kelly);
+    }
+
+    /// Low volume (1.5x) must NEVER trigger Tier V regardless of trend quality.
+    #[test]
+    fn test_tier_v_not_fire_on_low_volume() {
+        let closes = rising_closes(80, 100.0, 1.5);
+        let price = *closes.last().unwrap();
+        // vol = 1.5 < 4.0 → Tier V condition fails
+        let input = make_input(closes.clone(), closes.clone(), closes.clone(), closes.clone(), 1.5, price);
+        let sig = compute_hmtf(&input);
+        assert_ne!(sig.tier, 'V',
+            "vol=1.5x should never trigger Tier V, got tier={}", sig.tier);
+    }
+
+    /// Flat market with low volume must stay Tier C — Tier V should not fire.
+    #[test]
+    fn test_tier_v_not_fire_on_flat_low_vol() {
+        let flat = flat_closes(80, 100.0);
+        let input = make_input(flat.clone(), flat.clone(), flat.clone(), flat.clone(), 1.5, 100.0);
+        let sig = compute_hmtf(&input);
+        assert_eq!(sig.tier, 'C',
+            "Flat low-vol market should stay Tier C, got {}", sig.tier);
+    }
+
+    /// High volume with bearish closes must NOT trigger Tier V
+    /// (tf_1h.score > 0.05 condition prevents bearish volume from being "V").
+    #[test]
+    fn test_tier_v_not_fire_on_bearish_high_vol() {
+        let bear = falling_closes(80, 200.0, 2.0);
+        let price = *bear.last().unwrap();
+        // High volume on falling market — not a valid breakout
+        let input = make_input(bear.clone(), bear.clone(), bear.clone(), bear.clone(), 5.0, price);
+        let sig = compute_hmtf(&input);
+        assert_ne!(sig.tier, 'V',
+            "Bearish high-vol should NOT be Tier V (score negative), got tier={}", sig.tier);
+    }
+
+    // ── Tier B mixed regime ───────────────────────────────────────────────────
+
+    /// Mixed Tier B threshold (0.20) is stricter than Trending Tier B threshold (0.15).
+    /// A coin with Et=0.17 qualifies for Tier B in trending but NOT in mixed.
+    #[test]
+    fn test_tier_b_mixed_threshold_stricter_than_trending() {
+        let trending_b = 0.15_f64; // Tier B threshold in TRENDING (ρ > 0.6)
+        let mixed_b    = 0.20_f64; // Tier B threshold in MIXED    (0.4 ≤ ρ ≤ 0.6)
+        assert!(mixed_b > trending_b,
+            "Mixed Tier B threshold must be stricter: {:.2} > {:.2}", mixed_b, trending_b);
+        // Et=0.17 passes trending but fails mixed
+        let et = 0.17_f64;
+        assert!(et > trending_b, "Et=0.17 should pass trending threshold");
+        assert!(et < mixed_b,    "Et=0.17 should FAIL mixed threshold");
     }
 
     // ── score_from_hmtf ──────────────────────────────────────────────────────

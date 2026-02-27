@@ -91,7 +91,7 @@ pub fn evaluate(
         .coins
         .iter()
         .filter(|c| !open_symbols.contains(c.symbol.as_str()))
-        .filter(|c| c.ams_tier == 'A' || c.ams_tier == 'B' || c.ams_tier == 'R')
+        .filter(|c| matches!(c.ams_tier, 'A' | 'B' | 'R' | 'V'))
         .collect();
 
     let (candidates, ams_selected): (Vec<&CoinData>, bool) = if !ams_candidates.is_empty() {
@@ -149,7 +149,8 @@ pub fn evaluate(
     let hmtf_gate_val = match effective_tier {
         'A' => 0.8,
         'B' => 0.5,
-        'R' => 0.6, // reversion trades pass gate
+        'R' => 0.6,
+        'V' => 0.4, // volume breakout — lower gate value, half Kelly
         _ => 0.1,
     };
     let _ = hmtf_gate_val;
@@ -305,15 +306,16 @@ pub fn evaluate(
     } else {
         risk::adjusted_risk_pct(config, regime, confidence_label)
     };
-    // Apply AMS kelly multiplier for reversion trades
-    let risk_pct = if effective_tier == 'R' && best.ams_kelly_multiplier > 0.0 {
+    // Apply AMS kelly multiplier for R/V trades (half Kelly)
+    let risk_pct = if matches!(effective_tier, 'R' | 'V') && best.ams_kelly_multiplier > 0.0 {
         base_risk * best.ams_kelly_multiplier
     } else {
         base_risk
     };
     let atr_value = best.price * (best.atr14_pct / 100.0);
-    // Tier R: more conservative EV (win_rate=0.45, reward=1.2R)
-    let expected_r = if effective_tier == 'R' { 1.2 } else { 2.0 };
+    // Tier R/V: conservative EV (win_rate=0.45, reward=1.2R)
+    // Tier V is a 1H volume breakout — lower multi-TF confidence → same treatment as R
+    let expected_r = if matches!(effective_tier, 'R' | 'V') { 1.2 } else { 2.0 };
     if expected_r < config.min_expected_r {
         return no_trade(
             hour_label,
