@@ -963,6 +963,35 @@ fn main() -> Result<()> {
                 .map(|d| d.with_timezone(&Local)).unwrap_or_else(|_| Local::now());
             let hold_min = (Local::now() - opened_dt).num_minutes();
 
+            // ── Ghost position detection ─────────────────────────────────────
+            // If coin balance is dust (< min lot) the position was closed externally
+            // (algo order, manual, OKX liquidation) but DB was never updated.
+            // Auto-close immediately instead of retrying indefinitely.
+            {
+                let ccy = symbol.replace("USDT", "");
+                let avail = get_avail_coin(&client, &cfg, &ccy);
+                if qty_floor(avail) == 0.0 && avail < 0.001 {
+                    let ghost_pnl = (current - entry) * qty;
+                    println!("[executor] 👻 Ghost position {} — avail={:.6} (dust), hold={}min, \
+                              est PnL={:.4}U. Auto-closing DB.", symbol, avail, hold_min, ghost_pnl);
+                    let closed_now = chrono::Utc::now().to_rfc3339();
+                    live_conn.execute(
+                        "UPDATE open_positions SET status='CLOSED_GHOST', closed_at=? WHERE id=?",
+                        params![closed_now, pid]).ok();
+                    live_conn.execute(
+                        "UPDATE processed_signals SET status='CLOSED_GHOST', pnl_usdt=? WHERE signal_id=?",
+                        params![ghost_pnl, sig_id]).ok();
+                    let is_loss: i64 = if ghost_pnl < 0.0 { 1 } else { 0 };
+                    live_conn.execute(
+                        "UPDATE daily_stats SET realized_pnl=realized_pnl+?,
+                         trade_count=trade_count+1,
+                         consecutive_losses=CASE WHEN ?2=1 THEN consecutive_losses+1 ELSE 0 END
+                         WHERE trade_date=?3",
+                        params![ghost_pnl, is_loss, today]).ok();
+                    continue;
+                }
+            }
+
             // ── Track high_water mark and compute trailing stop ──────────────
             if current > high_water {
                 high_water = current;
