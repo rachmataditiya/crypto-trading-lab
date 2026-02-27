@@ -28,36 +28,36 @@ OKX REST + WebSocket API
           ▼
 ┌─────────────────────────────────────────────────────────┐
 │  realtime-engine (KeepAlive)                            │
-│  ├── Public WS:   ticker + books5 (19 coins, 38 ch)    │
-│  ├── Business WS: candle1H/4H/6H/12H (HMAC auth)      │
-│  ├── REST seed:   120×H1, 120×H4, 60×H6, 60×H12       │
-│  ├── AMS compute: ρ, D, E_trend, E_rev per coin        │
-│  └── Output:      realtime_cache.json (≤1 write/sec)   │
+│  ├── Public WS:   ticker + books5 (19 coins, 38 ch)     │
+│  ├── Business WS: candle1H/4H/6H/12H (HMAC auth)        │
+│  ├── REST seed:   120×H1, 120×H4, 60×H6, 60×H12         │
+│  ├── AMS compute: ρ, D, E_trend, E_rev per coin         │
+│  └── Output:      realtime_cache.json (≤1 write/sec)    │
 └────────────────────────┬────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │  sim-engine (every 300s)                                │
-│  ├── Reads realtime_cache.json + AMS fields            │
-│  ├── Tier A/B (trend) — Tier R (reversion, 0.5x Kelly) │
-│  ├── AMS gate + 6-gate quality filter                  │
-│  └── Output: sim_history.db (PAPER_TRADE / NO_TRADE)   │
+│  ├── Reads realtime_cache.json + AMS fields             │
+│  ├── Tier A/B (trend) — Tier R (reversion, 0.5x Kelly)  │
+│  ├── AMS gate + 6-gate quality filter                   │
+│  └── Output: sim_history.db (PAPER_TRADE / NO_TRADE)    │
 └────────────────────────┬────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │  live-executor (every 60s, KeepAlive)                   │
-│  ├── Reads PAPER_TRADE signals (last 20 min, by EV)    │
+│  ├── Reads PAPER_TRADE signals (last 20 min, by EV)     │
 │  ├── Gates: corr group, 30-min cooldown, circuit breaker│
-│  ├── Kelly × ams_kelly_multiplier → OKX market buy     │
-│  ├── Post-fill: query actual qty, place SL algo        │
-│  ├── Position monitor loop:                            │
-│  │   ├── TP2   → cancel algos → full market sell       │
-│  │   ├── Trail → 2.5% from high_water (after TP1)     │
-│  │   ├── TP1   → 50% sell, SL moved to breakeven      │
-│  │   ├── Time  → BTC/ETH 120min, mid 90min, alts 60min│
-│  │   └── SL    → software backup (algo = crash guard)  │
-│  └── Output: live_positions.db                         │
+│  ├── Kelly × ams_kelly_multiplier → OKX market buy      │
+│  ├── Post-fill: query actual qty, place SL algo         │
+│  ├── Position monitor loop:                             │
+│  │   ├── TP2   → cancel algos → full market sell        │
+│  │   ├── Trail → 2.5% from high_water (after TP1)       │
+│  │   ├── TP1   → 50% sell, SL moved to breakeven        │
+│  │   ├── Time  → BTC/ETH 120min, mid 90min, alts 60min. │
+│  │   └── SL    → software backup (algo = crash guard)   │
+│  └── Output: live_positions.db                          │
 └────────────────────────┬────────────────────────────────┘
                          │
                          ▼
