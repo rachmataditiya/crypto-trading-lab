@@ -5,9 +5,14 @@ use crate::risk;
 use crate::strategy;
 use std::path::Path;
 
-/// Read currently OPEN positions from the live executor DB.
-/// Used to populate SimState so strategy can exclude already-held symbols
-/// and correctly count open positions (max_open_positions gate).
+/// Read positions that the sim should treat as "unavailable":
+///   1. Currently OPEN (actively held by executor)
+///   2. Recently CLOSED within max cooldown window (120 min for TIME exit,
+///      30 min for normal close) — executor will SKIPPED_COOLDOWN these anyway,
+///      so sim should not waste cycles generating signals for them.
+///
+/// Both sets are returned as PaperPosition entries; strategy.rs excludes
+/// candidates by symbol regardless of whether the position is truly open.
 fn load_live_positions(workspace: &Path) -> Vec<PaperPosition> {
     use rusqlite::Connection;
     let db_path = workspace.join("data/trading-journal/live_positions.db");
@@ -15,14 +20,24 @@ fn load_live_positions(workspace: &Path) -> Vec<PaperPosition> {
         Ok(c) => c,
         Err(_) => return vec![],
     };
+
+    // Max cooldown window = 120 min (CLOSED_TIME). Use this as the lookback
+    // so we catch coins under both cooldown tiers in one query.
+    let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(120))
+        .to_rfc3339();
+
     let mut stmt = match conn.prepare(
         "SELECT symbol, entry_price, stop_price, tp1_price, risk_usdt, opened_at \
-         FROM open_positions WHERE status='OPEN'",
+         FROM open_positions \
+         WHERE status='OPEN' \
+            OR (status IN ('CLOSED','CLOSED_TIME','CLOSED_GHOST','CLOSED_SL') \
+                AND closed_at >= ?1)",
     ) {
         Ok(s) => s,
         Err(_) => return vec![],
     };
-    stmt.query_map([], |row| {
+
+    stmt.query_map([&cutoff], |row| {
         let opened_str: String = row.get(5).unwrap_or_default();
         let opened_at = chrono::DateTime::parse_from_rfc3339(&opened_str)
             .map(|d| d.with_timezone(&chrono::Utc))
