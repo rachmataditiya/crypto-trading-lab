@@ -74,15 +74,23 @@ pub fn evaluate(
     let speculative_avax_mode = config.preset.eq_ignore_ascii_case("aggressive");
 
     // ── Two-pass candidate selection ────────────────────────────────────────
+    // Pre-filter: exclude symbols that are already held in live positions.
+    //   Prevents infinite SKIPPED_DUPE loops when a Tier A/B coin is open —
+    //   sim engine will now look for the *next best* opportunity instead.
+    let open_symbols: std::collections::HashSet<&str> = state
+        .open_positions
+        .iter()
+        .map(|p| p.symbol.as_str())
+        .collect();
+
     // Pass 1 (AMS-first): any coin across full snapshot with AMS Tier A/B/R,
-    //   ranked by AMS entry score. Fixes the structural mismatch where the
-    //   Bayesian top-3 list (BTC/ETH/SOL) always wins coin selection even
-    //   when AMS finds better setups elsewhere (e.g. DOT Tier B).
+    //   NOT already held, ranked by AMS entry score.
     // Pass 2 (Bayesian fallback): if no AMS-qualified coin, fall back to the
     //   traditional watchlist top-3 ranked by Bayesian score.
     let ams_candidates: Vec<&CoinData> = snapshot
         .coins
         .iter()
+        .filter(|c| !open_symbols.contains(c.symbol.as_str()))
         .filter(|c| c.ams_tier == 'A' || c.ams_tier == 'B' || c.ams_tier == 'R')
         .collect();
 
@@ -92,6 +100,7 @@ pub fn evaluate(
         let bayesian: Vec<&CoinData> = snapshot
             .coins
             .iter()
+            .filter(|c| !open_symbols.contains(c.symbol.as_str()))
             .filter(|c| watchlist_top3.iter().any(|w| w.symbol == c.symbol))
             .collect();
         (bayesian, false)
@@ -758,6 +767,49 @@ mod tests {
             "Tier A (DOT) must beat Tier B (SOL) by entry score.\n\
              setup_idea='{}'\nquality_gate='{}'",
             result.setup_idea,
+            result.quality_gate
+        );
+    }
+
+    /// Regression: already-open coin must be excluded from AMS candidates.
+    /// Fix for the SKIPPED_DUPE loop where sim kept generating signals for
+    /// a coin already held in a live position (DOT bug 2026-02-27 session 2).
+    #[test]
+    fn test_already_open_coin_excluded_from_ams() {
+        let coins = vec![
+            make_ams_coin("BTCUSDT", 'B', 80, 'C', 0.1, 2.0),
+            make_ams_coin("ETHUSDT", 'B', 75, 'C', 0.1, 2.0),
+            make_ams_coin("SOLUSDT", 'B', 70, 'C', 0.1, 2.0),
+            make_ams_coin("DOTUSDT", 'B', 65, 'B', 0.7, 5.5), // Tier B — but already open
+        ];
+        let snapshot = make_ams_snapshot(coins);
+        let signal = make_ams_signal(&["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+        // Simulate DOT already held in live position
+        let mut state = SimState::new();
+        state.open_positions.push(PaperPosition {
+            symbol: "DOTUSDT".to_string(),
+            direction: Direction::Long,
+            entry_price: 1.60,
+            stop_price: 1.45,
+            tp_price: 1.80,
+            size_usdt: 24.0,
+            opened_at: chrono::Utc::now(),
+        });
+        let config = make_ams_config();
+        let news = NewsContext::default();
+
+        let result = evaluate(&snapshot, &signal, &news, &state, &config);
+
+        // DOT must NOT appear in result — it's already open
+        assert!(
+            !result.setup_idea.contains("DOTUSDT"),
+            "Already-open DOTUSDT must be excluded from candidates.\n\
+             setup_idea='{}'",
+            result.setup_idea
+        );
+        assert!(
+            !result.quality_gate.contains("DOTUSDT"),
+            "quality_gate must not reference DOTUSDT: '{}'",
             result.quality_gate
         );
     }

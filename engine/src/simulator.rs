@@ -5,6 +5,43 @@ use crate::risk;
 use crate::strategy;
 use std::path::Path;
 
+/// Read currently OPEN positions from the live executor DB.
+/// Used to populate SimState so strategy can exclude already-held symbols
+/// and correctly count open positions (max_open_positions gate).
+fn load_live_positions(workspace: &Path) -> Vec<PaperPosition> {
+    use rusqlite::Connection;
+    let db_path = workspace.join("data/trading-journal/live_positions.db");
+    let conn = match Connection::open(&db_path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT symbol, entry_price, stop_price, tp1_price, risk_usdt, opened_at \
+         FROM open_positions WHERE status='OPEN'",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map([], |row| {
+        let opened_str: String = row.get(5).unwrap_or_default();
+        let opened_at = chrono::DateTime::parse_from_rfc3339(&opened_str)
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now());
+        Ok(PaperPosition {
+            symbol: row.get(0)?,
+            direction: Direction::Long, // spot-only, always long
+            entry_price: row.get(1)?,
+            stop_price: row.get(2)?,
+            tp_price: row.get(3).unwrap_or(0.0),
+            size_usdt: row.get(4).unwrap_or(0.0),
+            opened_at,
+        })
+    })
+    .ok()
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
 /// PAPER-ONLY SAFEGUARD: This simulator never makes live API calls.
 /// All "trades" are simulated from parsed market data files.
 /// No exchange connections, no order submission, no wallet access.
@@ -41,13 +78,18 @@ pub fn run_cycle(
     };
     let news_context = data_feed::load_news_context(workspace);
 
-    // 2. Update risk state
+    // 2. Sync live open positions from executor DB.
+    //    This lets strategy exclude already-held symbols and correctly
+    //    evaluate max_open_positions — previously SimState was always empty.
+    state.open_positions = load_live_positions(workspace);
+
+    // 3. Update risk state
     risk::update_state(state, config);
 
-    // 3. Evaluate strategy
+    // 4. Evaluate strategy
     let result = strategy::evaluate(&snapshot, &signal, &news_context, state, config);
 
-    // 4. If trade decision, validate through risk module
+    // 5. If trade decision, validate through risk module
     if let Decision::PaperTrade { risk_pct, .. } = &result.decision {
         if let Err(reason) = risk::validate_trade(state, config, *risk_pct) {
             // Override to no-trade if risk validation fails
