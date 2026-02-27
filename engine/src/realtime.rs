@@ -74,6 +74,11 @@ pub struct SymbolState {
     pub ret_24h:     f64,
     pub ret_3d:      f64,
     pub ret_7d:      f64,
+    /// Intra-candle return since last confirmed 1H close.
+    /// Positive = price rising above last 1H close; Negative = fast drop (crash signal).
+    /// Used by live-executor fast-crash guard: block entry if ret_1h < -3.0%.
+    #[serde(default)]
+    pub ret_1h:      f64,
     pub ema20:       f64,
     pub ema50:       f64,
     pub rsi14:       f64,
@@ -548,6 +553,20 @@ fn recompute_indicators(state: &mut SymbolState) {
     state.ret_3d = sanitize::ret_pct(state.ret_24h * 1.8);
     state.ret_7d = sanitize::ret_pct(state.ret_24h * 3.0);
 
+    // Intra-1H return: how much price moved since the last confirmed 1H candle closed.
+    // Newest close is at the BACK of the deque (push_back order).
+    // A strongly negative value (< -3%) means a fast intra-candle crash — used by
+    // live-executor to block entries even when 4H EMA alignment still looks bullish.
+    state.ret_1h = if let Some(&prev_1h_close) = state.closes_1h.back() {
+        if prev_1h_close > 0.0 {
+            sanitize::ret_pct((state.price - prev_1h_close) / prev_1h_close * 100.0)
+        } else {
+            0.0
+        }
+    } else {
+        0.0 // no 1H data yet — fail-open (allow)
+    };
+
     // ── HMTF computation ──────────────────────────────────────────────────
     if state.closes_1h.len() >= 15
         && state.closes_4h.len() >= 15
@@ -920,5 +939,50 @@ mod tests {
         // After pushing 0,1,2,3,4 with max=3, should have [2,3,4]
         assert_eq!(dq[0], 2.0, "Oldest must be evicted first");
         assert_eq!(dq[2], 4.0, "Newest must be at back");
+    }
+
+    // ── ret_1h intra-candle momentum ───────────────────────────────────────
+
+    fn make_state_with_closes_1h(price: f64, prev_1h_close: f64) -> SymbolState {
+        let mut state = SymbolState::default();
+        state.price = price;
+        state.ret_24h = 2.0;
+        // Need enough closes for indicators; fill closes_4h with dummy data
+        for i in 0..25 { push_close(&mut state.closes_4h, 100.0 + i as f64 * 0.1, MAX_4H); }
+        push_close(&mut state.closes_1h, prev_1h_close, MAX_1H);
+        state
+    }
+
+    #[test]
+    fn ret_1h_positive_when_price_above_last_close() {
+        // prev close=1.560, current price=1.594 → ret_1h ≈ +2.18%
+        let mut state = make_state_with_closes_1h(1.594, 1.560);
+        recompute_indicators(&mut state);
+        assert!(state.ret_1h > 0.0,
+            "Price above prev 1H close must yield positive ret_1h, got {:.4}", state.ret_1h);
+        let expected = (1.594 - 1.560) / 1.560 * 100.0;
+        assert!((state.ret_1h - expected).abs() < 0.01,
+            "ret_1h={:.4} expected≈{:.4}", state.ret_1h, expected);
+    }
+
+    #[test]
+    fn ret_1h_negative_on_fast_crash() {
+        // prev close=1.630, current price=1.550 → ret_1h ≈ -4.9% (flash crash)
+        let mut state = make_state_with_closes_1h(1.550, 1.630);
+        recompute_indicators(&mut state);
+        assert!(state.ret_1h < -3.0,
+            "Fast crash -4.9% must yield ret_1h < -3.0, got {:.4}", state.ret_1h);
+    }
+
+    #[test]
+    fn ret_1h_zero_when_no_1h_closes() {
+        // No 1H closes yet (fresh warmup) → ret_1h must be 0.0 (fail-open)
+        let mut state = SymbolState::default();
+        state.price = 1.594;
+        state.ret_24h = 2.0;
+        for i in 0..25 { push_close(&mut state.closes_4h, 100.0 + i as f64 * 0.1, MAX_4H); }
+        recompute_indicators(&mut state);
+        assert_eq!(state.ret_1h, 0.0,
+            "No 1H closes → ret_1h must be 0.0 (fail-open), got {:.4}", state.ret_1h);
     }
 }

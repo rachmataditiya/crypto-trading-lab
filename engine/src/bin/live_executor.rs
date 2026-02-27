@@ -373,6 +373,26 @@ fn macro_ema_aligned(symbol: &str, cache_path: &Path) -> bool {
     price > ema20 && ema20 > ema50
 }
 
+/// Returns true if the coin's intra-1H momentum is NOT in a fast crash.
+///
+/// Reads `ret_1h` from realtime_cache — the return since the last confirmed 1H candle close.
+/// A strongly negative value means price is dropping hard WITHIN the current 1H candle,
+/// even if the 4H EMA stack still looks bullish (4H EMA lags by design).
+///
+/// Threshold -3.0%: a -3% intra-candle move in crypto is significant (normal noise is ≤1%).
+/// Above -3% (e.g. -1%, +2%) → momentum OK → allow entry.
+/// Below -3% (e.g. -4%, -7%) → fast crash in progress → block entry.
+///
+/// Fail-open: if cache/field missing, allow entry (other guards remain active).
+fn recent_momentum_ok(symbol: &str, cache_path: &Path) -> bool {
+    let cache_file = cache_path.join("trading-journal/realtime_cache.json");
+    let text = match std::fs::read_to_string(&cache_file) { Ok(t) => t, Err(_) => return true };
+    let d: serde_json::Value = match serde_json::from_str(&text) { Ok(v) => v, Err(_) => return true };
+    // ret_1h field absent (old cache) → 0.0 → fail-open
+    let ret_1h = d["symbols"][symbol]["ret_1h"].as_f64().unwrap_or(0.0);
+    ret_1h > -3.0
+}
+
 /// Returns how many CLOSED_TIME exits a symbol had today (UTC date).
 ///
 /// CLOSED_TIME = executor's time-stop: price failed to reach TP within hold_min.
@@ -947,6 +967,18 @@ fn main() -> Result<()> {
                     println!("[executor] ⛔ Macro EMA DOWN: {} — skip LONG in downtrend", sig.symbol);
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_EMA_DOWN",0.0,
                         "price<ema20 or ema20<ema50 (4H macro bearish)");
+                    continue;
+                }
+
+                // ── Fast crash / momentum guard ──────────────────────────────────────
+                // Block entry if intra-1H price drop exceeds -3% since last confirmed 1H close.
+                // Addresses the 4H EMA lag problem: 4H EMA can stay bullish for hours while
+                // price is actively crashing on shorter timeframes. ret_1h is computed from
+                // the WS-fed realtime_cache (≤1s latency), so it reflects actual fast moves.
+                if !recent_momentum_ok(&sig.symbol, &base.join("../..")) {
+                    println!("[executor] ⚡ Fast drop: {} — ret_1h < -3%, skip entry", sig.symbol);
+                    mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_FAST_DROP",0.0,
+                        "ret_1h < -3.0% (intra-1H crash while 4H EMA still lagging)");
                     continue;
                 }
 
@@ -2426,7 +2458,94 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // 21. DAILY CLOSED_TIME RE-ENTRY GUARD
+    // 21. FAST CRASH / MOMENTUM GUARD (ret_1h)
+    // Addresses 4H EMA lag: 4H EMA stays bullish while price crashes on 1H.
+    // guard blocks entry if ret_1h < -3.0% (intra-candle fast drop).
+    // ════════════════════════════════════════════════════════════════
+
+    fn write_cache_with_ret1h(dir: &tempfile::TempDir, symbol: &str, ret_1h: f64) {
+        std::fs::create_dir_all(dir.path().join("trading-journal")).unwrap();
+        let content = format!(
+            r#"{{"generated_at":"2026-02-27T13:00:00+00:00","symbols":{{"{}":{{"price":1.5,"ret_1h":{},"ema20":1.45,"ema50":1.35}}}}}}"#,
+            symbol, ret_1h
+        );
+        std::fs::write(dir.path().join("trading-journal/realtime_cache.json"), content).unwrap();
+    }
+
+    #[test]
+    fn momentum_ok_small_drop_allowed() {
+        // -1.5% intra-1H drop → well above -3% threshold → allow
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_with_ret1h(&dir, "DOTUSDT", -1.5);
+        assert!(recent_momentum_ok("DOTUSDT", dir.path()),
+            "-1.5% drop must be allowed (above -3% threshold)");
+    }
+
+    #[test]
+    fn momentum_ok_positive_momentum_allowed() {
+        // +2.3% intra-1H gain → strong buy momentum → allow
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_with_ret1h(&dir, "DOTUSDT", 2.3);
+        assert!(recent_momentum_ok("DOTUSDT", dir.path()),
+            "+2.3% gain must be allowed");
+    }
+
+    #[test]
+    fn momentum_fast_drop_blocked() {
+        // -4.5% intra-1H crash → fast drop → block entry
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_with_ret1h(&dir, "SOLUSDT", -4.5);
+        assert!(!recent_momentum_ok("SOLUSDT", dir.path()),
+            "-4.5% intra-1H drop must be blocked — 4H EMA lags this fast move");
+    }
+
+    #[test]
+    fn momentum_exactly_at_threshold_blocked() {
+        // -3.0% exactly → blocked (strict >)
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_with_ret1h(&dir, "BTCUSDT", -3.0);
+        assert!(!recent_momentum_ok("BTCUSDT", dir.path()),
+            "-3.0% exactly must be blocked (threshold is > -3.0, not >= -3.0)");
+    }
+
+    #[test]
+    fn momentum_just_inside_threshold_allowed() {
+        // -2.99% → just above threshold → allow
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_with_ret1h(&dir, "ETHUSDT", -2.99);
+        assert!(recent_momentum_ok("ETHUSDT", dir.path()),
+            "-2.99% must be allowed (just inside -3.0% threshold)");
+    }
+
+    #[test]
+    fn momentum_flash_crash_blocked() {
+        // -8% flash crash → definitely blocked
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_with_ret1h(&dir, "SOLUSDT", -8.0);
+        assert!(!recent_momentum_ok("SOLUSDT", dir.path()),
+            "-8% flash crash must be blocked");
+    }
+
+    #[test]
+    fn momentum_missing_ret1h_field_allowed() {
+        // Old cache without ret_1h field → default 0.0 → fail-open (allow)
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("trading-journal")).unwrap();
+        let content = r#"{"generated_at":"2026-02-27T13:00:00+00:00","symbols":{"DOTUSDT":{"price":1.5,"ema20":1.45,"ema50":1.35}}}"#;
+        std::fs::write(dir.path().join("trading-journal/realtime_cache.json"), content).unwrap();
+        assert!(recent_momentum_ok("DOTUSDT", dir.path()),
+            "Missing ret_1h field must fail-open (allow) — backward compat");
+    }
+
+    #[test]
+    fn momentum_no_cache_file_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(recent_momentum_ok("DOTUSDT", dir.path()),
+            "Missing cache file must fail-open (allow)");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 23. DAILY CLOSED_TIME RE-ENTRY GUARD
     // After 1 CLOSED_TIME on a coin today, block same-day re-entry.
     // Root cause: DOT re-entered 3.5h after first CLOSED_TIME → -$0.16 loss.
     // ════════════════════════════════════════════════════════════════
