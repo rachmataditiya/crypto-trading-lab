@@ -73,11 +73,29 @@ pub fn evaluate(
     // Aggressive mode: use EMA-alignment gates for any symbol (not just AVAXUSDT)
     let speculative_avax_mode = config.preset.eq_ignore_ascii_case("aggressive");
 
-    let candidates: Vec<&CoinData> = snapshot
+    // ── Two-pass candidate selection ────────────────────────────────────────
+    // Pass 1 (AMS-first): any coin across full snapshot with AMS Tier A/B/R,
+    //   ranked by AMS entry score. Fixes the structural mismatch where the
+    //   Bayesian top-3 list (BTC/ETH/SOL) always wins coin selection even
+    //   when AMS finds better setups elsewhere (e.g. DOT Tier B).
+    // Pass 2 (Bayesian fallback): if no AMS-qualified coin, fall back to the
+    //   traditional watchlist top-3 ranked by Bayesian score.
+    let ams_candidates: Vec<&CoinData> = snapshot
         .coins
         .iter()
-        .filter(|c| watchlist_top3.iter().any(|w| w.symbol == c.symbol))
+        .filter(|c| c.ams_tier == 'A' || c.ams_tier == 'B' || c.ams_tier == 'R')
         .collect();
+
+    let (candidates, ams_selected): (Vec<&CoinData>, bool) = if !ams_candidates.is_empty() {
+        (ams_candidates, true)
+    } else {
+        let bayesian: Vec<&CoinData> = snapshot
+            .coins
+            .iter()
+            .filter(|c| watchlist_top3.iter().any(|w| w.symbol == c.symbol))
+            .collect();
+        (bayesian, false)
+    };
 
     if candidates.is_empty() {
         return no_trade(
@@ -93,7 +111,15 @@ pub fn evaluate(
         );
     }
 
-    let best = candidates.iter().max_by_key(|c| c.score).unwrap();
+    // Pick best: AMS path → rank by entry score; Bayesian path → rank by score
+    let best = if ams_selected {
+        candidates.iter()
+            .max_by(|a, b| a.hmtf_entry_score.partial_cmp(&b.hmtf_entry_score)
+                .unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap()
+    } else {
+        candidates.iter().max_by_key(|c| c.score).unwrap()
+    };
     let confidence_label = indicators::confidence_label(best.score, best.volume_ratio);
     let prob = compute_probability(regime, best, news_context);
 
@@ -218,7 +244,7 @@ pub fn evaluate(
     ];
 
     let quality_gate = format!(
-        "gate(grade={},regime={},score={},volume={},adx={},confidence={},prob={});bayes(prior={:.2},tech={:.2},news={:.2},post={:.2});ams={},ams_regime={:.2},ams_div={:.3}",
+        "gate(grade={},regime={},score={},volume={},adx={},confidence={},prob={});bayes(prior={:.2},tech={:.2},news={:.2},post={:.2});ams={},ams_regime={:.2},ams_div={:.3},sel={}",
         setup_grade,
         pass_regime,
         pass_score,
@@ -233,6 +259,7 @@ pub fn evaluate(
         effective_tier,
         best.ams_regime_rho,
         best.ams_divergence_d,
+        if ams_selected { "ams" } else { "bayes" },
     );
 
     // All 7 gates must pass — no bypass. Aggressive mode already has looser thresholds.

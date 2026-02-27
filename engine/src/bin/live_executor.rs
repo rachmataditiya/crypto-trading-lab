@@ -986,10 +986,15 @@ fn main() -> Result<()> {
             // If coin balance is dust (< min lot) the position was closed externally
             // (algo order, manual, OKX liquidation) but DB was never updated.
             // Auto-close immediately instead of retrying indefinitely.
+            //
+            // IMPORTANT: Skip ghost detection for freshly-opened positions (<10 min).
+            // OKX locks the coin balance when a SL algo order is active, making avail≈0
+            // even though the position is live. A genuine ghost only occurs after the
+            // position has had time to be monitored (avail stays dust across multiple cycles).
             {
                 let ccy = symbol.replace("USDT", "");
                 let avail = get_avail_coin(&client, &cfg, &ccy);
-                if qty_floor(avail) == 0.0 && avail < 0.001 {
+                if qty_floor(avail) == 0.0 && avail < 0.001 && hold_min >= 10 {
                     // Try to get actual exit price from OKX fills history
                     // (covers: algo SL executed by OKX, manual close, liquidation)
                     let (exit_price, fill_note) = match get_last_sell_fill(&client, &cfg, &inst) {
