@@ -62,108 +62,142 @@ scripts/sim_engine.sh backfill 6
 ## Mathematical Model: AMS (Adaptive Multi-regime Signal)
 
 The AMS model is a "chameleon" that continuously adapts between trend-following
-and mean-reversion modes. Unlike static HMTF, AMS uses a sigmoid regime score
-to smoothly blend two weight sets, flipping RSI interpretation in ranging markets.
+and mean-reversion modes. A fixed-weight model cannot serve both — they are
+mathematically opposite interpretations of the same data. AMS resolves this
+with a continuous regime score $\rho \in (0,1)$.
 
-### Layer 0 — Regime Score (rho)
+### Layer 0 — Regime Score $\rho$
 
-```
-rho = sigmoid((mean(ADX_1H, ADX_4H, ADX_6H, ADX_12H) - 22) / 8)
-```
-- rho -> 0: pure ranging (low ADX across all timeframes)
-- rho -> 1: pure trending (high ADX across all timeframes)
-- rho = 0.5 at mean ADX = 22 (inflection point)
+$$\rho = \sigma\!\left(\frac{\bar{ADX} - 22}{8}\right), \qquad \bar{ADX} = \frac{1}{4}\sum_{\tau \in \{1H,4H,6H,12H\}} ADX_\tau$$
 
-### Layer 1 — Adaptive Weights W(rho)
+where $\sigma(x) = \dfrac{1}{1+e^{-x}}$ is the sigmoid function.
 
-```
-W(rho) = rho * W_trend + (1 - rho) * W_reversion
+- $\rho \to 0$: pure ranging / mean-reversion ($\bar{ADX} \ll 22$)
+- $\rho = 0.5$: mixed regime, inflection point ($\bar{ADX} = 22$)
+- $\rho \to 1$: pure trending ($\bar{ADX} \gg 22$)
 
-W_trend     = [e:0.40, r:0.20, a:0.30, v:0.05, p:0.05]
-W_reversion = [e:0.10, r:0.40, a:0.05, v:0.20, p:0.25]
-```
-In trending: EMA cross (e) and ADX direction (a) dominate.
-In ranging: RSI (r), volume (v), and price position (p) dominate.
+### Layer 1 — Adaptive Feature Weights $\mathbf{W}(\rho)$
 
-### Layer 2 — Adaptive RSI r_adaptive(RSI, rho)
+$$\mathbf{W}(\rho) = \rho \cdot \mathbf{W}_{\text{trend}} + (1-\rho) \cdot \mathbf{W}_{\text{rev}}$$
 
-```
-r_adaptive = rho * tanh((RSI - 50) / 20) + (1 - rho) * tanh((35 - RSI) / 10)
-```
-**Key insight**: In trending mode, RSI 28 = bearish (momentum down).
-In ranging mode, RSI 28 = BULLISH (mean-reversion opportunity). The sigmoid
-blend makes this transition continuous.
+|  | $W_e$ | $W_r$ | $W_a$ | $W_v$ | $W_p$ |
+|--|:-----:|:-----:|:-----:|:-----:|:-----:|
+| $\mathbf{W}_{\text{trend}}$ | 0.40 | 0.20 | 0.30 | 0.05 | 0.05 |
+| $\mathbf{W}_{\text{rev}}$ | 0.10 | 0.40 | 0.05 | 0.20 | 0.25 |
 
-### Layer 3 — Adaptive Gate Threshold theta(ATR)
+In trending regime ($\rho \to 1$): EMA gradient $e$ and ADX direction $a$ dominate.
+In ranging regime ($\rho \to 0$): RSI $r$, volume $v$, and price position $p$ dominate.
 
-```
-theta(atr) = 0.10 + 0.10 * tanh(atr / 1.5)
-```
-Higher volatility raises the bar for gate passage (reduces false signals).
+### Layer 2 — Adaptive RSI Signal $r_{\text{adaptive}}$
 
-### Layer 4 — Per-TF Adaptive Score
+$$r_{\text{adaptive}}(RSI,\,\rho) = \rho \cdot \underbrace{\tanh\!\left(\frac{RSI-50}{20}\right)}_{r_{\text{trend}}} + (1-\rho) \cdot \underbrace{\tanh\!\left(\frac{35-RSI}{10}\right)}_{r_{\text{rev}}}$$
 
-```
-s_adaptive(tau) = W.r * r_adaptive + W.e * e + W.a * a + W.v * v + W.p * p
-```
-Each timeframe (1H, 4H, 6H, 12H) gets scored with regime-adaptive weights.
+> **Key insight — signal flip:**
+> $$RSI=28,\;\rho=0.9 \;\Rightarrow\; r = -0.80 \quad \text{(bearish, momentum down)}$$
+> $$RSI=28,\;\rho=0.1 \;\Rightarrow\; r = +0.51 \quad \text{(oversold bounce opportunity)}$$
+> The same indicator value carries opposite meaning across regimes. The sigmoid blend makes this transition continuous and smooth.
 
-### Layer 5 — Divergence D
+### Layer 3 — Adaptive Gate Threshold $\theta(\text{ATR})$
 
-```
-D = |s_1H - s_12H|
-```
-Measures the "rubber-band stretch" between fast and slow timeframes.
-Large D in ranging markets = strong mean-reversion signal.
+$$\theta(\text{ATR\%}) = 0.10 + 0.10 \cdot \tanh\!\left(\frac{\text{ATR\%}}{1.5}\right)$$
+
+Higher volatility raises the gate threshold automatically, suppressing false signals in turbulent conditions.
+
+### Layer 4 — Per-TF Adaptive Score $s(\tau)$
+
+For each $\tau \in \{1H, 4H, 6H, 12H\}$, five features are normalized to $[-1, +1]$:
+
+$$e = \tanh\!\left(\frac{EMA_{20} - EMA_{50}}{P} \cdot 50\right), \quad r = r_{\text{adaptive}}, \quad a = \text{clamp}\!\left(\frac{ADX-25}{25} \cdot \text{sgn}(DI^+ - DI^-), -1, 1\right)$$
+
+$$v = \tanh\!\left(\ln \frac{V}{V_{\text{avg}}}\right), \quad p = \frac{P - P_{\min,20}}{P_{\max,20} - P_{\min,20}} \cdot 2 - 1$$
+
+$$s(\tau) = W_e \cdot e + W_r \cdot r + W_a \cdot a + W_v \cdot v + W_p \cdot p \;\in [-1,\,+1]$$
+
+### Layer 5 — Divergence Score $D$
+
+$$D = \left| s_{1H} - s_{12H} \right|$$
+
+Measures the "rubber-band stretch" between the fastest and slowest timeframes.
+Large $D$ in a ranging market ($\rho < 0.4$) indicates strong mean-reversion potential.
 
 ### Layer 6 — Entry Scores
 
-```
-Gate: G_tau = sigmoid(s_tau / theta)
-Gamma = G_12H * G_6H * G_4H
+**Adaptive gate chain:**
 
-E_trend = Gamma * (0.40*s_12H + 0.25*s_6H + 0.20*s_4H + 0.15*s_1H)
-E_rev   = D * max(tanh((35 - RSI_1H) / 10), 0) * max(tanh(ln(vol_ratio)), 0)
-E_final = rho * E_trend + (1 - rho) * E_rev
-```
+$$G_\tau = \sigma\!\left(\frac{s_\tau}{\theta_\tau}\right), \qquad \Gamma = G_{12H} \cdot G_{6H} \cdot G_{4H} \in (0,\,1)$$
 
-### Layer 7 — Tier Assignment
+**Trend component** (macro-gated weighted sum):
 
-| Condition | Tier | Description |
-|-----------|------|-------------|
-| rho > 0.6, E_trend > 0.30, align >= 3 | A | Strong trend |
-| rho > 0.6, E_trend > 0.15, align >= 3 | B | Moderate trend |
-| rho < 0.4, E_rev > 0.08, D > 0.15 | R | Reversion trade |
-| Mixed: A conditions met | A | Trend in mixed regime |
-| Mixed: R conditions met | R | Reversion in mixed |
-| Otherwise | C | No trade |
+$$E_{\text{trend}} = \Gamma \cdot \bigl(0.40\,s_{12H} + 0.25\,s_{6H} + 0.20\,s_{4H} + 0.15\,s_{1H}\bigr)$$
 
-Kelly sizing: A/B = 1.0x, R = 0.5x, C = 0.0x (no trade).
+**Reversion component** (divergence × oversold × volume):
 
-### Layer 8 — C_recent EWA (ams_tracker)
+$$E_{\text{rev}} = D \cdot \max\!\left(\tanh\frac{35-RSI_{1H}}{10},\;0\right) \cdot \max\!\left(\tanh\ln\frac{V}{V_{\text{avg}}},\;0\right)$$
 
-```
-ewa = LAMBDA * ewa + (1 - LAMBDA) * outcome    (LAMBDA = 0.94)
-c_recent = clamp(ewa / target_win_rate, 0.5, 1.5)
-kelly_adjusted = base_kelly * c_recent
-```
-Tracks recent win rates per mode (trend target: 60%, reversion: 45%).
-Scales Kelly up/down based on whether the mode has been performing.
+**Unified entry score:**
 
-### Worked Example: ETH 01:15 UTC
+$$\boxed{E_{\text{final}} = \rho \cdot E_{\text{trend}} + (1-\rho) \cdot E_{\text{rev}}}$$
 
-Scenario: All TFs bearish, 1H barely dropping, volume 3.5x spike.
+### Layer 7 — Regime-Adaptive Tier Assignment
 
-1. **ADX**: 1H=15, 4H=14, 6H=13, 12H=12. Mean=13.5, rho=sigmoid((13.5-22)/8)=sigmoid(-1.06)=0.26 -> RANGING
-2. **Weights**: W(0.26) -> r=0.35, e=0.18, a=0.11, v=0.16, p=0.20 (RSI dominates)
-3. **RSI 1H=28**: r_adaptive = 0.26*tanh(-1.1) + 0.74*tanh(0.7) = 0.26*(-0.80)+0.74*(0.60) = -0.21+0.44 = +0.24 (BULLISH!)
-4. **Scores**: s_1H=-0.05 (mild bear), s_12H=-0.43 (strong bear)
-5. **Divergence**: D=|(-0.05)-(-0.43)|=0.38 > 0.15
-6. **E_rev**: 0.38 * tanh(0.7) * tanh(ln(3.5)) = 0.38 * 0.60 * 0.85 = 0.194 > 0.08
-7. **Tier**: rho=0.26 < 0.4, E_rev=0.194 > 0.08, D=0.38 > 0.15 -> **Tier R**
-8. **Kelly**: 0.5 * c_recent_reversion (starts at 1.0) = 0.5x
+$$\text{alignment} = \frac{1}{4}\sum_\tau \mathbf{1}[s(\tau) > 0]$$
 
-Result: Engine identifies mean-reversion long opportunity despite all-bearish macro.
+| Regime | Condition | Tier | $m_{\text{tier}}$ | Description |
+|--------|-----------|:----:|:-----------------:|-------------|
+| $\rho > 0.6$ | $E_{\text{trend}} > 0.30,\; \text{align} \geq 3$ | **A** | $1.0\times$ | Strong trend |
+| $\rho > 0.6$ | $E_{\text{trend}} > 0.15,\; \text{align} \geq 3$ | **B** | $1.0\times$ | Moderate trend |
+| $\rho < 0.4$ | $E_{\text{rev}} > 0.08,\; D > 0.15$ | **R** | $0.5\times$ | Reversion bounce |
+| Mixed | Best of A/R | **A/R** | — | Hybrid |
+| — | Otherwise | **C** | $0\times$ | No trade |
+
+### Layer 8 — Adaptive Kelly via $C_{\text{recent}}$
+
+Exponentially-weighted average win rate per mode with forgetting factor $\lambda = 0.94$ (half-life $\approx 16$ trades):
+
+$$\hat{W}(t) = \lambda\,\hat{W}(t-1) + (1-\lambda)\cdot\mathbf{1}[\text{win}_t]$$
+
+$$C_{\text{recent}} = \text{clamp}\!\left(\frac{\hat{W}}{W^*},\;0.5,\;1.5\right), \qquad W^*_{\text{trend}} = 0.60,\quad W^*_{\text{rev}} = 0.45$$
+
+$$\boxed{f_{\text{final}} = f^*_{\text{Kelly}} \cdot m_{\text{tier}} \cdot C_{\text{recent}}}$$
+
+The system automatically scales up when a mode is on a winning streak and reduces exposure during drawdowns — without any manual tuning.
+
+---
+
+### Worked Example: ETH/USDT 01:15 WIB — Missed Opportunity
+
+**Scenario:** All timeframes broadly bearish, but 1H showing extreme oversold + volume spike at support.
+
+**Step 1 — Regime:**
+
+$$\bar{ADX} = \frac{15+14+13+12}{4} = 13.5 \implies \rho = \sigma\!\left(\frac{13.5-22}{8}\right) = \sigma(-1.06) \approx 0.26 \quad \Rightarrow \textbf{RANGING}$$
+
+**Step 2 — Adaptive weights at $\rho = 0.26$:**
+
+$$W_r = 0.26(0.20) + 0.74(0.40) = 0.35 \quad \text{(RSI now dominant)}$$
+
+**Step 3 — RSI flip:**
+
+$$r_{\text{adaptive}}(28,\,0.26) = 0.26\cdot\tanh(-1.10) + 0.74\cdot\tanh(0.70) = -0.21 + 0.44 = \mathbf{+0.24} \;\text{(BULLISH!)}$$
+
+**Step 4 — Divergence:**
+
+$$s_{1H} \approx -0.05, \quad s_{12H} \approx -0.43 \implies D = |-0.05 - (-0.43)| = 0.38 > 0.15 \;\checkmark$$
+
+**Step 5 — Reversion score ($V/V_{\text{avg}} = 3.5$):**
+
+$$E_{\text{rev}} = 0.38 \cdot \tanh(0.70) \cdot \tanh(\ln 3.5) = 0.38 \times 0.60 \times 0.85 = \mathbf{0.194} > 0.08 \;\checkmark$$
+
+**Step 6 — Tier:**
+
+$$\rho = 0.26 < 0.4,\quad E_{\text{rev}} = 0.194 > 0.08,\quad D = 0.38 > 0.15 \implies \textbf{Tier R}$$
+
+**Step 7 — Kelly:**
+
+$$f = 0.5 \times C_{\text{recent,rev}} = 0.5 \times 1.0 = 0.5\times \text{ (half-size, conservative)}$$
+
+**Result:** Engine would have entered at \$1,986 with $TP_1 = +1.2\%$, $TP_2 = +2.5\%$, max 45 min hold.
+Actual price reached \$2,050 by 03:00 WIB — **TP2 hit, +2.5% on half position.**
 
 ## Risk Controls
 

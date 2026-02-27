@@ -86,75 +86,89 @@ Group 4: DOGE, LTC
 
 ## 🧮 Mathematical Model — AMS
 
-> Full derivation with proofs: [`engine/README.md`](engine/README.md#mathematical-model-ams-adaptive-multi-regime-signal)
+> Full derivation with worked example: [`engine/README.md`](engine/README.md#mathematical-model-ams-adaptive-multi-regime-signal)
 
-The core insight: **trend-following and mean-reversion are mathematically opposite interpretations of the same data.** A fixed-weight model cannot serve both. AMS uses a continuous regime score ρ to interpolate between two expert systems.
+The core insight: **trend-following and mean-reversion are mathematically opposite interpretations of the same data.** AMS resolves this with a continuous regime score $\rho$ that interpolates between two expert weight systems.
 
-### Layer 0 — Regime Score ρ
-```
-ρ = σ((mean(ADX_1H, ADX_4H, ADX_6H, ADX_12H) − 22) / 8)
+### Layer 0 — Regime Score $\rho$
 
-ρ → 1.0  strong trend (ADX >> 22)
-ρ → 0.5  mixed regime (ADX ≈ 22)  ← most common
-ρ → 0.0  ranging / reversion (ADX << 22)
-```
+$$\rho = \sigma\!\left(\frac{\bar{ADX} - 22}{8}\right), \qquad \bar{ADX} = \frac{ADX_{1H}+ADX_{4H}+ADX_{6H}+ADX_{12H}}{4}$$
 
-### Layer 1 — Adaptive Weights W(ρ)
-```
-W(ρ) = ρ × W_trend + (1−ρ) × W_reversion
+where $\sigma(x) = \dfrac{1}{1+e^{-x}}$ is the sigmoid function.
 
-           EMA    RSI    ADX    Vol    Pos
-W_trend  = [0.40, 0.20, 0.30, 0.05, 0.05]
-W_rev    = [0.10, 0.40, 0.05, 0.20, 0.25]
-```
+| $\rho$ | Regime | Interpretation |
+|--------|--------|----------------|
+| $\rho \to 1$ | **TRENDING** | Strong directional move |
+| $\rho \approx 0.5$ | **MIXED** | Most common — hybrid signal |
+| $\rho \to 0$ | **RANGING** | Mean-reversion opportunity |
 
-### Layer 2 — Adaptive RSI (key insight — signal flip)
-```
-r_trend(RSI)      = tanh((RSI − 50) / 20)
-r_reversion(RSI)  = tanh((35 − RSI) / 10)   ← positive when oversold!
+### Layer 1 — Adaptive Weights $\mathbf{W}(\rho)$
 
-r_adaptive = ρ × r_trend + (1−ρ) × r_reversion
+$$\mathbf{W}(\rho) = \rho \cdot \mathbf{W}_{\text{trend}} + (1-\rho) \cdot \mathbf{W}_{\text{rev}}$$
 
-RSI = 28, ρ = 0.9 (trending)  →  r = −0.80  (bearish)
-RSI = 28, ρ = 0.1 (ranging)   →  r = +0.51  (bounce opportunity) ← FLIP
-```
+|  | $W_e$ (EMA) | $W_r$ (RSI) | $W_a$ (ADX) | $W_v$ (Vol) | $W_p$ (Pos) |
+|--|:-----------:|:-----------:|:-----------:|:-----------:|:-----------:|
+| $\mathbf{W}_{\text{trend}}$ | 0.40 | 0.20 | 0.30 | 0.05 | 0.05 |
+| $\mathbf{W}_{\text{rev}}$ | 0.10 | 0.40 | 0.05 | 0.20 | 0.25 |
 
-### Layer 3 — Adaptive Gate Threshold θ(ATR)
-```
-θ(atr%) = 0.10 + 0.10 × tanh(atr% / 1.5)
-```
-High volatility raises the gate automatically.
+### Layer 2 — Adaptive RSI Signal $r_{\text{adaptive}}$ *(key insight)*
 
-### Layers 4–6 — Score, Divergence, Entry
-```
-s(τ) = W.r·r_adaptive + W.e·e + W.a·a + W.v·v + W.p·p   ∈ [−1, +1]
+$$r_{\text{adaptive}}(RSI,\,\rho) = \rho \cdot \underbrace{\tanh\!\left(\frac{RSI-50}{20}\right)}_{r_{\text{trend}}} + (1-\rho) \cdot \underbrace{\tanh\!\left(\frac{35-RSI}{10}\right)}_{r_{\text{rev}}}$$
 
-D     = |s_1H − s_12H|                  ← rubber-band stretch
-Γ     = σ(s_12H/θ) × σ(s_6H/θ) × σ(s_4H/θ)  ← gate chain
+> **Signal flip:** $RSI=28,\;\rho=0.9$ (trending) $\Rightarrow r=-0.80$ (bearish).
+> $RSI=28,\;\rho=0.1$ (ranging) $\Rightarrow r=+0.51$ (bounce opportunity). Same data, opposite meaning.
 
-E_trend = Γ × (0.40·s_12H + 0.25·s_6H + 0.20·s_4H + 0.15·s_1H)
-E_rev   = D × max(tanh((35−RSI_1H)/10), 0) × max(tanh(ln(vol)), 0)
-E_final = ρ × E_trend + (1−ρ) × E_rev
-```
+### Layer 3 — Adaptive Gate Threshold $\theta(\text{ATR})$
+
+$$\theta(\text{ATR\%}) = 0.10 + 0.10 \cdot \tanh\!\left(\frac{\text{ATR\%}}{1.5}\right)$$
+
+Higher volatility tightens the gate automatically — fewer false breakouts.
+
+### Layers 4–6 — Score, Divergence & Entry
+
+**Per-TF adaptive score** for each $\tau \in \{1H,4H,6H,12H\}$:
+
+$$s(\tau) = W_r \cdot r_{\text{adaptive}} + W_e \cdot e + W_a \cdot a + W_v \cdot v + W_p \cdot p \;\in [-1,\,+1]$$
+
+**Divergence** (rubber-band stretch between micro and macro):
+
+$$D = \left|s_{1H} - s_{12H}\right|$$
+
+**Gate chain** with adaptive thresholds:
+
+$$G_\tau = \sigma\!\left(\frac{s_\tau}{\theta_\tau}\right), \qquad \Gamma = G_{12H} \cdot G_{6H} \cdot G_{4H}$$
+
+**Entry scores:**
+
+$$E_{\text{trend}} = \Gamma \cdot \bigl(0.40\,s_{12H} + 0.25\,s_{6H} + 0.20\,s_{4H} + 0.15\,s_{1H}\bigr)$$
+
+$$E_{\text{rev}} = D \cdot \max\!\left(\tanh\frac{35-RSI_{1H}}{10},\;0\right) \cdot \max\!\left(\tanh\ln\frac{V}{V_{\text{avg}}},\;0\right)$$
+
+$$\boxed{E_{\text{final}} = \rho \cdot E_{\text{trend}} + (1-\rho) \cdot E_{\text{rev}}}$$
 
 ### Layer 7 — Tier Assignment
-| Regime | Condition | Tier | Kelly |
-|--------|-----------|------|-------|
-| ρ > 0.6 | E_trend > 0.30, align ≥ 3 | **A** | 1.0× |
-| ρ > 0.6 | E_trend > 0.15, align ≥ 3 | **B** | 1.0× |
-| ρ < 0.4 | E_rev > 0.08, D > 0.15 | **R** | 0.5× |
+
+| Regime | Condition | Tier | Kelly mult. |
+|--------|-----------|:----:|:-----------:|
+| $\rho > 0.6$ | $E_{\text{trend}} > 0.30,\; \text{align} \geq 3$ | **A** | $1.0\times$ |
+| $\rho > 0.6$ | $E_{\text{trend}} > 0.15,\; \text{align} \geq 3$ | **B** | $1.0\times$ |
+| $\rho < 0.4$ | $E_{\text{rev}} > 0.08,\; D > 0.15$ | **R** | $0.5\times$ |
 | Mixed | Best of A/R above | **A/R** | — |
-| — | Otherwise | **C** | skip |
+| — | Otherwise | **C** | $0\times$ |
 
-**Tier R** = mean-reversion bounce: half Kelly, conservative TP (1.2R), max 45 min hold.
+**Tier R** = mean-reversion bounce: $0.5\times$ Kelly, $TP = 1.2R$, max 45 min hold.
 
-### Layer 8 — C_recent Adaptive Kelly
-```
-ewa(t) = λ × ewa(t−1) + (1−λ) × outcome    λ = 0.94 (~16 trade half-life)
-C_recent = clamp(ewa / target_win_rate, 0.5, 1.5)
-kelly_final = base_kelly × tier_mult × C_recent
-```
-System scales position size up/down based on recent per-mode performance.
+### Layer 8 — Adaptive Kelly via $C_{\text{recent}}$
+
+Exponentially weighted win-rate per mode ($\lambda = 0.94$, half-life $\approx 16$ trades):
+
+$$\hat{W}(t) = \lambda\,\hat{W}(t-1) + (1-\lambda)\cdot\mathbf{1}[\text{win}_t]$$
+
+$$C_{\text{recent}} = \text{clamp}\!\left(\frac{\hat{W}}{W^*},\;0.5,\;1.5\right), \quad W^*_{\text{trend}}=0.60,\quad W^*_{\text{rev}}=0.45$$
+
+$$\boxed{f_{\text{final}} = f_{\text{Kelly}} \cdot m_{\text{tier}} \cdot C_{\text{recent}}}$$
+
+The system automatically increases size when a mode is winning and reduces exposure during drawdowns.
 
 ---
 
@@ -173,13 +187,12 @@ All gates must pass for a signal to become a trade:
 | **Prob/EV** | Bayesian posterior ≥ threshold, EV ≥ 0.5R |
 
 ### Bayesian Probability Model
-```
-feature = 0.22×trend + 0.16×ema_stack + 0.16×momentum
-        + 0.20×volume + 0.12×adx − 0.08×rsi + 0.06×news
 
-posterior = bayesian_update(prior=0.62, tech_lh, news_lh)
-EV = p_up × 2.0R − p_down × 1.0R
-```
+$$\phi = 0.22\,\text{trend} + 0.16\,\text{EMA}_{\text{stack}} + 0.16\,\text{mom} + 0.20\,\text{vol} + 0.12\,\text{ADX} - 0.08\,\text{RSI} + 0.06\,\text{news}$$
+
+$$P(\uparrow \mid \text{tech}) \propto P(\text{tech} \mid \uparrow) \cdot P_0, \qquad P_0 = 0.62$$
+
+$$EV = P_\uparrow \cdot 2R - P_\downarrow \cdot R$$
 
 ### Volume Tiers
 ```
@@ -203,12 +216,18 @@ When price moves between signal generation and execution:
 
 ## ⚖️ Risk Management
 
-### Fractional Kelly Sizing (25% Kelly)
-```
-Tier A  (EV ≥ 1.5R, conf ≥ 0.7)  → 3–4% per trade
-Tier B  (EV ≥ 0.8R, conf ≥ 0.4)  → 1.5–2.5% per trade
-Tier C  (EV < 0.5R or conf < 0.15) → SKIP
-```
+### Fractional Kelly Sizing
+
+$$f^* = \frac{p \cdot b - q}{b}, \qquad f_{\text{trade}} = 0.25 \cdot f^* \cdot m_{\text{tier}} \cdot C_{\text{recent}}$$
+
+where $b$ = reward/risk ratio, $p$ = win probability, $q = 1-p$.
+
+| Tier | Condition | Risk per trade |
+|------|-----------|:--------------:|
+| **A** | $EV \geq 1.5R,\; \text{conf} \geq 0.7$ | 3–4% |
+| **B** | $EV \geq 0.8R,\; \text{conf} \geq 0.4$ | 1.5–2.5% |
+| **R** | $E_{\text{rev}} > 0.08,\; D > 0.15$ | 0.75–1.5% |
+| **C** | $EV < 0.5R$ | skip |
 
 ### Portfolio Rules
 | Rule | Value |
@@ -237,7 +256,7 @@ With cooldown:
 
 The **120-min extended cooldown for `CLOSED_TIME`** prevents re-entry into a setup that already failed to develop. If price didn't move in 60–120 min, the same H4 setup is still valid but momentum hasn't arrived — re-entry would just time-out again.
 
-Mathematically: `cooldown ≈ 1 × timeframe_resolution` (one H4 candle reset window).
+Mathematically: $t_{\text{cooldown}} \approx \Delta t_{\text{TF}}$ — one timeframe candle as minimum signal-invalidation window.
 
 ### Per-Coin Time-Stop
 Large caps move slowly and need more time to develop a move:
