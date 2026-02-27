@@ -49,8 +49,9 @@ OKX REST + WebSocket API
 ┌─────────────────────────────────────────────────────────┐
 │  live-executor (60s loop, KeepAlive)                    │
 │  ├── Reads PAPER_TRADE signals (last 20 min, by EV)     │
-│  ├── Guards: corr group, cooldown, circuit breaker,     │
-│  │           macro EMA DOWN, daily CLOSED_TIME re-entry │
+│  ├── Guards: corr, cooldown, circuit breaker,           │
+│  │           macro EMA DOWN, fast crash (ret_1h<-3%),   │
+│  │           daily CLOSED_TIME re-entry                 │
 │  ├── Kelly × ams_kelly_multiplier → OKX market buy      │
 │  ├── Post-fill: query actual qty, place SL algo         │
 │  ├── Position monitor loop (price via WS-fed cache):    │
@@ -307,6 +308,7 @@ Blocks entry when:
 | `SKIPPED_TIER_C` | Signal EV/confidence too weak |
 | `SKIPPED_BALANCE` | Insufficient USDT balance |
 | `SKIPPED_EMA_DOWN` | Macro trend bearish: price < EMA20 or EMA20 < EMA50 (4H) |
+| `SKIPPED_FAST_DROP` | ret_1h < -3%: fast intra-candle crash detected (4H EMA lag guard) |
 | `SKIPPED_DAILY_TIME_EXIT` | Coin already had CLOSED_TIME exit today — no same-day re-entry |
 
 ---

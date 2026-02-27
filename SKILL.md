@@ -32,7 +32,7 @@ sim-engine (every 5 min)
         ▼
 live-executor (every 60s)
   reads PAPER_TRADE signals from last 20 min
-  correlation + cooldown + circuit-breaker gates
+  correlation + cooldown + circuit-breaker + macro EMA + fast-crash guards
   Kelly sizing → OKX market buy
   60s polling: SL (algo) + TP1/TP2/Trail/Time exits (software)
   writes: live_positions.db
@@ -135,22 +135,28 @@ pgrep -f "realtime-daemon" && echo "✅ realtime-engine" || echo "❌ realtime-e
 |---|---|
 | `PAPER_TRADE` | Executable signal (executor will trade) |
 | `NO_TRADE` | Signal evaluated, rejected |
-| `SKIPPED_STALE` | Signal > 20 min old |
+| `SKIPPED_STALE` | Price dumped >3% or chasing >10% from signal entry |
 | `SKIPPED_CORR` | Same correlation group already open |
-| `SKIPPED_COOLDOWN` | Symbol in 30-min cooldown |
+| `SKIPPED_COOLDOWN` | Symbol in 30-min cooldown after close |
 | `SKIPPED_MAXPOS` | Already 3 open positions |
-| `SKIPPED_DUPE` | Duplicate signal for same symbol |
-| `SKIPPED_TIER_C` | Low EV signal |
-| `SKIPPED_PUMP_DUMP` | Pump/dump pattern detected |
-| `SKIPPED_NOISY_WINDOW` | High volatility noise window |
-| `FILLED` | Buy order executed |
-| `CLOSED_TP` | TP1 partial exit |
+| `SKIPPED_DUPE` | Duplicate signal, same symbol already open |
+| `SKIPPED_TIER_C` | Low EV/confidence signal |
+| `SKIPPED_PUMP_DUMP` | Pump/dump pattern: vol>4x+RSI>78 or price>EMA20×1.08 |
+| `SKIPPED_NOISY_WINDOW` | Asian pre-market 07:00–07:30 WIB, non-Tier-A |
+| `SKIPPED_EMA_DOWN` | Macro 4H trend bearish: price<EMA20 or EMA20<EMA50 |
+| `SKIPPED_FAST_DROP` | ret_1h < -3%: fast intra-candle crash (4H EMA lag guard) |
+| `SKIPPED_DAILY_TIME_EXIT` | Coin already had CLOSED_TIME today — no same-day re-entry |
+| `SKIPPED_PORT_RISK` | Portfolio risk cap reached |
+| `SKIPPED_BALANCE` | Insufficient USDT balance |
+| `FILLED` | Buy order executed on OKX |
+| `CLOSED_TP` | TP1 partial exit (50% sold) |
 | `CLOSED_TP2` | Full exit at TP2 |
-| `CLOSED_TRAIL` | Trailing stop triggered |
-| `CLOSED_TIME` | 60-min time stop |
+| `CLOSED_TRAIL` | Trailing stop triggered (2.5% from high_water) |
+| `CLOSED_TIME` | Time stop: BTC/ETH=120min, mid-cap=90min, alts=60min |
 | `CLOSED_SL` | Stop-loss triggered |
-| `CLOSED_BREAKEVEN` | SL moved to breakeven, stopped |
-| `CLOSED_MANUAL` | Manual intervention |
+| `CLOSED_BREAKEVEN` | SL moved to breakeven after TP1, then stopped |
+| `CLOSED_GHOST` | Ghost position auto-closed (OKX SL filled between polls) |
+| `CLOSED_MANUAL` | Manual intervention by owner |
 
 ---
 
@@ -170,7 +176,7 @@ cargo build --release --bin live-executor
 cargo build --release --bin sim-engine
 ```
 
-**Current test count:** 47 tests | **Warnings:** 0
+**Current test count:** 227 tests (126 live-executor + 101 sim-engine) | **Warnings:** 0
 
 ---
 
