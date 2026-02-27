@@ -1,6 +1,6 @@
 # Crypto Trading Lab — Ops State (Persistent Snapshot)
 
-Last updated: 2026-02-27 WIB (Asia/Jakarta)
+Last updated: 2026-02-27 11:30 WIB (Asia/Jakarta)
 
 ---
 
@@ -47,15 +47,17 @@ OKX REST + WS
 realtime-engine (KeepAlive)
   ├── Public WS: ticker + books5 (19 coins, 38 channels)
   ├── Business WS: candle1m/1H/4H/1D (19 coins, 76 channels, HMAC auth)
-  ├── REST seed: 120×H1, 120×H4, 100×D1 at startup
+  ├── REST seed: 120×H1, 120×H4, 60×H6, 60×H12, 100×D1 at startup
   ├── Indicators: RSI14, EMA20, EMA50, ATR14, ADX14 from H4 candles
-  └── Output: realtime_cache.json (persisted ≤1x/second)
+  ├── AMS Model: per-coin ρ (regime), D (divergence), E_trend, E_reversion, E_final
+  └── Output: realtime_cache.json (persisted ≤1x/second, includes ams_* fields)
   │
   ▼
 sim-engine (every 300s)
   ├── Reads realtime_cache.json
-  ├── Signal tiers: A (EV ≥ 1.5) / B (EV ≥ 1.0) / C (skip)
-  ├── Gates: regime, pump/dump, stale, noisy window
+  ├── AMS tiers: A (E_trend>0.30, align≥3) / B (E_trend>0.15) / R (E_rev>0.08, D>0.15) / C
+  ├── Tier R = mean-reversion: 0.5x Kelly, max 45min hold, EV=1.2R
+  ├── Gates: ams_gate, regime, pump/dump, stale, noisy window
   └── Output: sim_history.db (decision = PAPER_TRADE | NO_TRADE)
   │
   ▼
@@ -111,6 +113,7 @@ live-executor (every 60s)
 | EMA was SMA | Fixed — proper EMA with alpha = 2/(n+1), warm-up period |
 | `avail=0` → OKX borrow error | Return `false` immediately, retry next poll |
 | Dead code warnings | `#[allow(dead_code)]` on `Signal` struct |
+| Ghost position loop (780+ min!) | Added ghost detection: if `avail < 0.001` at cycle start → auto-close DB as `CLOSED_GHOST` |
 | `journal_closed` wrong label for TP2/Trail/Breakeven | Fixed — all 7 exit types now have correct label + specific lesson learned |
 | `is_risk_ok` not testable (inline) | Extracted as pure function — 10 unit tests added |
 | Time-stop hardcoded 60min semua coin | Per-coin `max_hold_min()`: BTC/ETH=120min, mid-cap=90min, high-beta=60min |
@@ -228,5 +231,5 @@ Action saat tembus:
 ## Notes
 
 - `memory_search` may fail (OpenAI embeddings 401 error — API key pending config)
-- If `avail=0` on sell → position will retry next 60s cycle (not a bug)
+- If `avail=0` on sell → position retries next 60s cycle; if dust persists → auto-closed as `CLOSED_GHOST` (2026-02-27 fix)
 - `journal-writer` and `alert-guard` check `consecutive_losses` from `daily_stats` table
