@@ -614,4 +614,175 @@ mod tests {
         let old_thr = 0.3_f64;
         assert!(new_thr > old_thr * 5.0, "New gate should be at least 5x stricter than old 0.3x gate");
     }
+
+    // ===========================================================
+    // AMS-FIRST SELECTION — REGRESSION TESTS
+    // These tests encode the specific architectural bug fixed on 2026-02-27:
+    // strategy.rs pre-filtered candidates to watchlist_top3 (BTC/ETH/SOL),
+    // so DOT (AMS Tier B) was never evaluated even when BTC/ETH/SOL were Tier C.
+    // ===========================================================
+
+    fn make_ams_coin(symbol: &str, grade: char, score: i32, ams_tier: char, hmtf_score: f64, vol: f64) -> CoinData {
+        CoinData {
+            symbol: symbol.to_string(),
+            grade,
+            score,
+            price: 100.0,
+            ret_24h: 3.0,
+            ret_3d: 4.0,
+            ret_7d: 6.0,
+            ema20: 95.0,
+            ema50: 88.0,
+            rsi14: 55.0,
+            atr14_pct: 2.0,
+            adx14: 30.0,
+            range_pos_7d: 0.65,
+            volume_ratio: vol,
+            regime: "trending".to_string(),
+            hmtf_entry_score: hmtf_score,
+            hmtf_alignment: 3,
+            hmtf_tier: ams_tier,
+            ams_regime_rho: 0.65,
+            ams_regime_label: "TRENDING".to_string(),
+            ams_divergence_d: 0.1,
+            ams_e_trend: hmtf_score,
+            ams_e_reversion: 0.2,
+            ams_tier,
+            ams_kelly_multiplier: 1.0,
+        }
+    }
+
+    fn make_ams_snapshot(coins: Vec<CoinData>) -> MarketSnapshot {
+        MarketSnapshot {
+            timestamp: "2026-02-27T00:00:00Z".to_string(),
+            market_regime: "RISK_ON".to_string(),
+            breadth_above_ema50: 14,
+            breadth_total: 19,
+            coins,
+            watchlist: vec![],
+        }
+    }
+
+    fn make_ams_signal(top3: &[&str]) -> SignalReport {
+        SignalReport {
+            market_mode: "normal".to_string(),
+            btc_eth_alert: "none".to_string(),
+            watchlist: top3.iter().enumerate().map(|(i, s)| WatchlistEntry {
+                symbol: s.to_string(),
+                grade: 'B',
+                score: 80 - i as i32 * 5,
+                ret_24h: 2.0,
+                ret_3d: 3.0,
+                volume_ratio: 3.0,
+            }).collect(),
+        }
+    }
+
+    fn make_ams_config() -> AccountConfig {
+        use crate::config::RealtimeConfig;
+        AccountConfig {
+            mode: "paper".to_string(),
+            execution: "simulate".to_string(),
+            base_currency: "USDT".to_string(),
+            initial_capital: 100.0,
+            max_risk_per_trade_pct: 2.0,
+            max_open_positions: 3,
+            daily_kill_switch_r: 3.0,
+            min_volume_ratio: 1.5,
+            min_score_to_trade: 60,
+            min_adx: 25.0,
+            min_expected_r: 1.0,
+            preset: "normal".to_string(),
+            realtime: RealtimeConfig::default(),
+        }
+    }
+
+    /// Regression: DOT Tier B (outside watchlist top-3) must be selected
+    /// over BTC/ETH/SOL Tier C (inside watchlist top-3).
+    /// This is the specific AMS-selection bug fixed on 2026-02-27.
+    #[test]
+    fn test_ams_first_selects_tier_b_outside_watchlist() {
+        let coins = vec![
+            make_ams_coin("BTCUSDT", 'B', 80, 'C', 0.1, 2.0),
+            make_ams_coin("ETHUSDT", 'B', 75, 'C', 0.1, 2.0),
+            make_ams_coin("SOLUSDT", 'B', 70, 'C', 0.1, 2.0),
+            make_ams_coin("DOTUSDT", 'B', 65, 'B', 0.7, 5.5), // Tier B — NOT in top-3
+        ];
+        let snapshot = make_ams_snapshot(coins);
+        let signal = make_ams_signal(&["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+        let state = SimState::new();
+        let config = make_ams_config();
+        let news = NewsContext::default();
+
+        let result = evaluate(&snapshot, &signal, &news, &state, &config);
+
+        // AMS-first path must evaluate DOTUSDT, not BTC/ETH/SOL
+        let dot_evaluated = result.setup_idea.contains("DOTUSDT")
+            || result.quality_gate.contains("DOTUSDT");
+        assert!(
+            dot_evaluated,
+            "AMS Tier B (DOTUSDT) should be selected over Tier C top-3.\n\
+             setup_idea='{}'\nquality_gate='{}'",
+            result.setup_idea,
+            result.quality_gate
+        );
+        // Confirm sel=ams is logged
+        assert!(
+            result.quality_gate.contains("sel=ams"),
+            "quality_gate should log sel=ams when AMS path used: '{}'",
+            result.quality_gate
+        );
+    }
+
+    /// Tier A coin must beat Tier B coin (ranked by hmtf_entry_score).
+    #[test]
+    fn test_ams_tier_a_beats_tier_b_by_entry_score() {
+        let coins = vec![
+            make_ams_coin("BTCUSDT", 'B', 80, 'C', 0.1, 2.0),
+            make_ams_coin("SOLUSDT", 'B', 65, 'B', 0.5, 4.0), // Tier B
+            make_ams_coin("DOTUSDT", 'B', 60, 'A', 0.9, 5.0), // Tier A, higher score → wins
+        ];
+        let snapshot = make_ams_snapshot(coins);
+        let signal = make_ams_signal(&["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+        let state = SimState::new();
+        let config = make_ams_config();
+        let news = NewsContext::default();
+
+        let result = evaluate(&snapshot, &signal, &news, &state, &config);
+
+        // DOTUSDT (Tier A, score=0.9) must beat SOLUSDT (Tier B, score=0.5)
+        let dot_evaluated = result.setup_idea.contains("DOTUSDT")
+            || result.quality_gate.contains("ams=A");
+        assert!(
+            dot_evaluated,
+            "Tier A (DOT) must beat Tier B (SOL) by entry score.\n\
+             setup_idea='{}'\nquality_gate='{}'",
+            result.setup_idea,
+            result.quality_gate
+        );
+    }
+
+    /// When no AMS-qualified coin exists, must fall back to Bayesian top-3 (sel=bayes).
+    #[test]
+    fn test_ams_fallback_to_bayes_when_all_tier_c() {
+        let coins = vec![
+            make_ams_coin("BTCUSDT", 'B', 80, 'C', 0.1, 2.0),
+            make_ams_coin("ETHUSDT", 'B', 75, 'C', 0.1, 2.0),
+            make_ams_coin("SOLUSDT", 'B', 65, 'C', 0.1, 2.0),
+        ];
+        let snapshot = make_ams_snapshot(coins);
+        let signal = make_ams_signal(&["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+        let state = SimState::new();
+        let config = make_ams_config();
+        let news = NewsContext::default();
+
+        let result = evaluate(&snapshot, &signal, &news, &state, &config);
+
+        assert!(
+            result.quality_gate.contains("sel=bayes"),
+            "Should use Bayesian fallback when no AMS-qualified coin.\n\
+             quality_gate='{}'",
+            result.quality_gate
+        );
+    }
 }
