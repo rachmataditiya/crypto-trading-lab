@@ -146,11 +146,14 @@ live-executor (every 60s)
 | 20 | `compute_sl_tp_from_fill` edge cases | 3 |
 | 21 | Kelly tier C + zero base | 2 |
 | 22 | Circuit breaker (`is_risk_ok`) | 10 |
-| **Total live-executor** | | **108 passing** |
+| 20 | Macro EMA aligned guard | 5 |
+| 21 | Daily CLOSED_TIME re-entry guard | 6 |
+| **Total live-executor** | | **118 passing** |
 | realtime (confirmed_close + push_close) | 9 |
-| sim-engine lib (strategy, hmtf, ams_tracker, etc.) | 90 |
+| sim-engine lib (strategy, hmtf, ams_tracker, etc.) | 89 |
 | strategy AMS-first regression | 3 |
-| **Grand total** | | **198 passing, 0 warnings** |
+| strategy macro EMA gate regression | 2 |
+| **Grand total** | | **216 passing, 0 warnings** |
 
 ---
 

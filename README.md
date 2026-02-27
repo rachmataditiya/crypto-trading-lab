@@ -13,7 +13,7 @@ A fully automated crypto trading system built from scratch with:
 - **AMS signal engine** — Adaptive Multi-regime Signal across 1H/4H/6H/12H timeframes (see [Math Model](#-mathematical-model--ams))
 - **Chameleon regime detection** — continuous score ρ blends trend-following ↔ mean-reversion automatically
 - **Live order execution** — OKX spot market orders, fractional Kelly sizing, software SL/TP
-- **Multi-position management** — up to 3 concurrent, correlation-aware, 30-min cooldown per coin
+- **Multi-position management** — up to 3 concurrent, correlation-aware, cooldown + macro EMA guard per coin
 - **Daily reporting** — WhatsApp summary via OpenClaw at 17:00 WIB
 
 **Halal constraint enforced:** spot long-only, no shorts, no leverage, no derivatives, no riba.
@@ -38,20 +38,22 @@ OKX REST + WebSocket API
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │  sim-engine (every 300s)                                │
-│  ├── Reads realtime_cache.json + AMS fields             │
-│  ├── Tier A/B (trend) — Tier R (reversion, 0.5x Kelly)  │
-│  ├── AMS gate + 6-gate quality filter                   │
+│  ├── Reads realtime_cache.json (WS-fed, ≤1s fresh)      │
+│  ├── Tier A/B (trend), Tier R (reversion), Tier V (vol) │
+│  ├── AMS-first selection: pass 1 AMS, pass 2 Bayesian   │
+│  ├── 8-gate quality filter (incl. macro EMA alignment)  │
 │  └── Output: sim_history.db (PAPER_TRADE / NO_TRADE)    │
 └────────────────────────┬────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────┐
-│  live-executor (every 60s, KeepAlive)                   │
+│  live-executor (60s loop, KeepAlive)                    │
 │  ├── Reads PAPER_TRADE signals (last 20 min, by EV)     │
-│  ├── Gates: corr group, 30-min cooldown, circuit breaker│
+│  ├── Guards: corr group, cooldown, circuit breaker,     │
+│  │           macro EMA DOWN, daily CLOSED_TIME re-entry │
 │  ├── Kelly × ams_kelly_multiplier → OKX market buy      │
 │  ├── Post-fill: query actual qty, place SL algo         │
-│  ├── Position monitor loop:                             │
+│  ├── Position monitor loop (price via WS-fed cache):    │
 │  │   ├── TP2   → cancel algos → full market sell        │
 │  │   ├── Trail → 2.5% from high_water (after TP1)       │
 │  │   ├── TP1   → 50% sell, SL moved to breakeven        │
@@ -304,6 +306,8 @@ Blocks entry when:
 | `SKIPPED_PUMP_DUMP` | Pump/exhaustion pattern detected |
 | `SKIPPED_TIER_C` | Signal EV/confidence too weak |
 | `SKIPPED_BALANCE` | Insufficient USDT balance |
+| `SKIPPED_EMA_DOWN` | Macro trend bearish: price < EMA20 or EMA20 < EMA50 (4H) |
+| `SKIPPED_DAILY_TIME_EXIT` | Coin already had CLOSED_TIME exit today — no same-day re-entry |
 
 ---
 
@@ -454,8 +458,8 @@ tail -30 /tmp/openclaw/live-executor.log
 
 | Limitation | Impact | Mitigation |
 |-----------|--------|-----------|
-| OKX acctLv=1: no algo conditional orders | Software SL only | 60s poll + cancel_algos before sell |
-| Software SL latency (~60s) | Flash crash risk | OKX algo SL as crash backup |
+| OKX acctLv=1: no algo conditional orders | Software SL only | 60s executor loop + cancel_algos before sell |
+| Software SL latency (~60s) | Flash crash risk | OKX algo SL as backup; price read from WS-fed cache (≤1s) |
 | 5-min signal cadence | May miss fast micro-pumps | Covers >90% large-cap moves |
 | H4 indicators lag short-term | May block valid 15m setups | By design — filters noise |
 

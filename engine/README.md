@@ -145,9 +145,12 @@ $$\text{alignment} = \frac{1}{4}\sum_\tau \mathbf{1}[s(\tau) > 0]$$
 | Regime | Condition | Tier | $m_{\text{tier}}$ | Description |
 |--------|-----------|:----:|:-----------------:|-------------|
 | $\rho > 0.6$ | $E_{\text{trend}} > 0.30,\; \text{align} \geq 3$ | **A** | $1.0\times$ | Strong trend |
-| $\rho > 0.6$ | $E_{\text{trend}} > 0.15,\; \text{align} \geq 3$ | **B** | $1.0\times$ | Moderate trend |
+| $\rho > 0.6$ | $E_{\text{trend}} > 0.15,\; \text{align} \geq 2$ | **B** | $1.0\times$ | Moderate trend |
 | $\rho < 0.4$ | $E_{\text{rev}} > 0.08,\; D > 0.15$ | **R** | $0.5\times$ | Reversion bounce |
-| Mixed | Best of A/R | **A/R** | — | Hybrid |
+| Mixed ($0.4 \leq \rho \leq 0.6$) | $E_{\text{trend}} > 0.30,\; \text{align} \geq 3$ | **A** | $1.0\times$ | Strong trend in mixed |
+| Mixed ($0.4 \leq \rho \leq 0.6$) | $E_{\text{trend}} > 0.20,\; \text{align} \geq 2$ | **B** | $1.0\times$ | Moderate (stricter threshold) |
+| Mixed ($0.4 \leq \rho \leq 0.6$) | $E_{\text{rev}} > 0.08,\; D > 0.15$ | **R** | $0.5\times$ | Reversion in mixed |
+| Any | vol\_ratio $> 4\times$, ADX $> 28$, RSI $< 78$, align $\geq 2$ | **V** | $0.5\times$ | Volume breakout (1H only) |
 | — | Otherwise | **C** | $0\times$ | No trade |
 
 ### Layer 8 — Adaptive Kelly via $C_{\text{recent}}$
