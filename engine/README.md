@@ -156,9 +156,9 @@ Exponentially-weighted average win rate per mode with forgetting factor $\lambda
 
 $$\hat{W}(t) = \lambda\,\hat{W}(t-1) + (1-\lambda)\cdot\mathbf{1}[\text{win}_t]$$
 
-$$C_{\text{recent}} = \text{clamp}\!\left(\frac{\hat{W}}{W^{\ast}},\;0.5,\;1.5\right), \qquad W^{\ast}_{\text{trend}} = 0.60,\quad W^{\ast}_{\text{rev}} = 0.45$$
+$$C_{\text{recent}} = \text{clamp}\left(\frac{\hat{W}}{W_0},\;0.5,\;1.5\right), \qquad W_{0,\text{trend}} = 0.60,\quad W_{0,\text{rev}} = 0.45$$
 
-$$\boxed{f_{\text{final}} = f^{\ast}_{\text{Kelly}} \cdot m_{\text{tier}} \cdot C_{\text{recent}}}$$
+$$\boxed{f_{\text{final}} = f_{\text{Kelly}} \cdot m_{\text{tier}} \cdot C_{\text{recent}}}$$
 
 The system automatically scales up when a mode is on a winning streak and reduces exposure during drawdowns — without any manual tuning.
 
