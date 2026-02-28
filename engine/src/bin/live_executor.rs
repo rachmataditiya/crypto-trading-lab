@@ -361,7 +361,17 @@ fn is_pump_or_exhausted(symbol: &str, cache_path: &Path, ecfg: &ExecutorConfig) 
 ///
 /// Fail-open on cache error: if cache is unreadable, allow entry (other guards remain active).
 /// Fail-open on zero EMA: OKX-reported EMA not yet warmed up — allow entry conservatively.
-fn macro_ema_aligned(symbol: &str, cache_path: &Path) -> bool {
+/// Check macro EMA alignment, with tier-aware relaxation.
+///
+/// Tier A/B (trend-following): require full bull stack price > EMA20 > EMA50.
+/// Tier R/V (mean-reversion / volume breakout): only require price > EMA20.
+///   Rationale: Tier R entries are by definition in macro-bearish conditions (oversold
+///   bounces). Requiring EMA20 > EMA50 defeats mean-reversion purpose entirely.
+///   Tier V also leads higher TFs, so EMA50 catching up is expected.
+///   This mirrors the fix in strategy.rs `pass_macro_ema`.
+///
+/// `is_reversion_tier`: true if AMS tier is R or V.
+fn macro_ema_aligned(symbol: &str, cache_path: &Path, is_reversion_tier: bool) -> bool {
     let cache_file = cache_path.join("trading-journal/realtime_cache.json");
     let text = match std::fs::read_to_string(&cache_file) { Ok(t) => t, Err(_) => return true };
     let d: serde_json::Value = match serde_json::from_str(&text) { Ok(v) => v, Err(_) => return true };
@@ -370,7 +380,11 @@ fn macro_ema_aligned(symbol: &str, cache_path: &Path) -> bool {
     let ema20 = sym["ema20"].as_f64().unwrap_or(0.0);
     let ema50 = sym["ema50"].as_f64().unwrap_or(0.0);
     if ema20 <= 0.0 || ema50 <= 0.0 { return true; } // warm-up not done — allow
-    price > ema20 && ema20 > ema50
+    if is_reversion_tier {
+        price > ema20  // relaxed: bounce above short-term average is enough
+    } else {
+        price > ema20 && ema20 > ema50  // strict: full bull stack for trend trades
+    }
 }
 
 /// Returns true if the coin's intra-1H momentum is NOT in a fast crash.
@@ -818,20 +832,20 @@ fn main() -> Result<()> {
         if risk_ok {
             let sim_conn = Connection::open(&sim_path)?;
             let mut stmt = sim_conn.prepare(
-                "SELECT id, raw_block, expected_value_r, confidence, p_up, p_down
+                "SELECT id, raw_block, expected_value_r, confidence, p_up, p_down, quality_gate
                  FROM simulation_events
                  WHERE decision='PAPER_TRADE'
                    AND trade_date=?1
                    AND trade_time >= ?2
                  ORDER BY expected_value_r DESC"  // best EV first
             )?;
-            let rows: Vec<(i64, String, Option<f64>, Option<f64>, Option<f64>, Option<f64>)> =
+            let rows: Vec<(i64, String, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<String>)> =
                 stmt.query_map(params![today, cutoff], |r| {
-                    Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))
+                    Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))
                 })?.filter_map(|r| r.ok()).collect();
             drop(stmt); drop(sim_conn);
 
-            for (sig_id, raw_block, ev, conf, p_up, p_down) in rows {
+            for (sig_id, raw_block, ev, conf, p_up, p_down, quality_gate) in rows {
                 if is_processed(&live_conn, sig_id) { continue; }
 
                 println!("[executor] 🔔 Signal #{} EV={:.2} Conf={:.2}",
@@ -965,7 +979,14 @@ fn main() -> Result<()> {
                 // Block LONG entry if price < EMA20 or EMA20 < EMA50 (macro bearish stack).
                 // Root cause of 2026-02-27 losses: DOT×2 + SOL×1 entered against macro trend.
                 // Realtime cache uses confirmed 4H candles — reliable macro trend indicator.
-                if !macro_ema_aligned(&sig.symbol, &base.join("../..")) {
+                // Exception: Tier R and V use relaxed check (price > EMA20 only) — see fn docstring.
+                let ams_tier_char = quality_gate.as_deref().unwrap_or("")
+                    .split(';').find(|s| s.starts_with("ams="))
+                    .and_then(|s| s.strip_prefix("ams="))
+                    .and_then(|s| s.chars().next())
+                    .unwrap_or('C');
+                let is_reversion_tier = ams_tier_char == 'R' || ams_tier_char == 'V';
+                if !macro_ema_aligned(&sig.symbol, &base.join("../.."), is_reversion_tier) {
                     println!("[executor] ⛔ Macro EMA DOWN: {} — skip LONG in downtrend", sig.symbol);
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_EMA_DOWN",0.0,
                         "price<ema20 or ema20<ema50 (4H macro bearish)");
@@ -2417,29 +2438,46 @@ mod tests {
 
     #[test]
     fn macro_ema_aligned_bull_stack_allowed() {
-        // price=100 > ema20=95 > ema50=88 → bull stack → allow entry
+        // price=100 > ema20=95 > ema50=88 → bull stack → allow (trend mode)
         let dir = tempfile::tempdir().unwrap();
         write_cache_with_emas(&dir, "SOLUSDT", 100.0, 95.0, 88.0);
-        assert!(macro_ema_aligned("SOLUSDT", dir.path()),
+        assert!(macro_ema_aligned("SOLUSDT", dir.path(), false),
             "Bull stack (price>EMA20>EMA50) must be allowed");
     }
 
     #[test]
     fn macro_ema_aligned_price_below_ema20_blocked() {
-        // price=82 < ema20=87 < ema50=92 → full bear stack → block
+        // price=82 < ema20=87 → block even in reversion mode
         let dir = tempfile::tempdir().unwrap();
         write_cache_with_emas(&dir, "SOLUSDT", 82.0, 87.0, 92.0);
-        assert!(!macro_ema_aligned("SOLUSDT", dir.path()),
+        assert!(!macro_ema_aligned("SOLUSDT", dir.path(), false),
             "Bear stack (price<EMA20<EMA50) must be blocked — 2026-02-27 SOL pattern");
+        assert!(!macro_ema_aligned("SOLUSDT", dir.path(), true),
+            "Price below EMA20 must be blocked even in reversion mode (no bounce yet)");
     }
 
     #[test]
-    fn macro_ema_aligned_ema20_below_ema50_blocked() {
-        // price=90 > ema20=88 but ema20<ema50=92 → death cross → block
+    fn macro_ema_aligned_ema20_below_ema50_blocked_for_trend() {
+        // price=90 > ema20=88 but ema20<ema50=92 → death cross
+        // Trend mode: blocked. Reversion mode: allowed (price > EMA20 is enough).
         let dir = tempfile::tempdir().unwrap();
         write_cache_with_emas(&dir, "SOLUSDT", 90.0, 88.0, 92.0);
-        assert!(!macro_ema_aligned("SOLUSDT", dir.path()),
-            "Death cross (EMA20<EMA50) must be blocked even if price>EMA20");
+        assert!(!macro_ema_aligned("SOLUSDT", dir.path(), false),
+            "Death cross (EMA20<EMA50) must be blocked in trend mode");
+        assert!(macro_ema_aligned("SOLUSDT", dir.path(), true),
+            "Tier R/V: price>EMA20 is sufficient even if EMA20<EMA50 (oversold bounce)");
+    }
+
+    #[test]
+    fn macro_ema_aligned_tier_r_eth_march01_pattern() {
+        // ETH 2026-03-01: price=1977 > ema20=1947 but ema20(1947) < ema50(1953)
+        // Old code: blocked. New code Tier R: allowed.
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_with_emas(&dir, "ETHUSDT", 1977.0, 1947.0, 1953.0);
+        assert!(!macro_ema_aligned("ETHUSDT", dir.path(), false),
+            "Trend mode must block ETH death cross");
+        assert!(macro_ema_aligned("ETHUSDT", dir.path(), true),
+            "Tier R must allow ETH bounce — this is the 2026-03-01 missed trade");
     }
 
     #[test]
@@ -2447,7 +2485,7 @@ mod tests {
         // Symbol not in cache → default 0.0 → zero EMA → fail-open (allow)
         let dir = tempfile::tempdir().unwrap();
         write_cache_with_emas(&dir, "BTCUSDT", 100.0, 95.0, 88.0);
-        assert!(macro_ema_aligned("XRPUSDT", dir.path()),
+        assert!(macro_ema_aligned("XRPUSDT", dir.path(), false),
             "Missing symbol in cache must fail-open (allow)");
     }
 
@@ -2455,7 +2493,7 @@ mod tests {
     fn macro_ema_aligned_no_cache_file_allowed() {
         // Cache file doesn't exist → fail-open (allow) — other guards still active
         let dir = tempfile::tempdir().unwrap();
-        assert!(macro_ema_aligned("SOLUSDT", dir.path()),
+        assert!(macro_ema_aligned("SOLUSDT", dir.path(), false),
             "Missing cache file must fail-open (allow)");
     }
 
