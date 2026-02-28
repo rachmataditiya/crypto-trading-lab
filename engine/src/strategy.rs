@@ -188,9 +188,21 @@ pub fn evaluate(
     // Prevents entering LONG on a 1H bounce inside a macro downtrend where all 4H EMAs are DOWN.
     // Root cause of 2026-02-27 losses: system generated Tier A signals (DOT×2, SOL×1) while
     // most coins had EMA=DOWN on realtime cache (confirmed 4H candles).
-    // This gate is UNCONDITIONAL — both modes must pass it. EMA stack is deterministic,
-    // not confidence-weighted: either the macro trend supports the trade or it doesn't.
-    let pass_macro_ema = best.price > best.ema20 && best.ema20 > best.ema50;
+    //
+    // Exception: Tier R (mean-reversion) only requires price > EMA20.
+    // Rationale: Tier R is designed for oversold bounces — by definition the EMA stack
+    // is often bearish (EMA20 < EMA50) at the entry point. Requiring EMA20 > EMA50
+    // completely defeats the mean-reversion purpose.
+    // Tier V (volume breakout) also gets the relaxed check — it fires when 1H leads
+    // higher TFs, so EMA50 catching up is expected.
+    let is_reversion_tier = effective_tier == 'R' || effective_tier == 'V';
+    let pass_macro_ema = if is_reversion_tier {
+        // Relaxed: just price above EMA20 (bouncing above short-term average)
+        best.price > best.ema20
+    } else {
+        // Strict: full bull stack required for Tier A/B trend-following
+        best.price > best.ema20 && best.ema20 > best.ema50
+    };
 
     let checklist_pass_count = [
         pass_regime,

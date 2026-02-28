@@ -62,8 +62,8 @@ fi
 if [ -n "$RESTARTED" ]; then
     echo "[$NOW] RESTARTED:$RESTARTED" >> "$LOG"
     /Users/rachmataditiya/.local/bin/openclaw message send \
-        --channel whatsapp \
-        --target "+6281268289854" \
+        --channel telegram \
+        --target "84806079" \
         --message "🚨 *Self-Heal Alert* [${NOW}]
 
 Engine di-restart otomatis:

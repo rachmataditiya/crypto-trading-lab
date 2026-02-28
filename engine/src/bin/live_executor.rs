@@ -803,7 +803,9 @@ fn main() -> Result<()> {
         cfg.risk_per_trade_pct, ecfg.max_open_positions, ecfg.max_portfolio_risk_pct);
 
     loop {
-        let today  = Local::now().format("%Y-%m-%d").to_string();
+        // Use UTC date to match closed_at which is stored as Utc::now().to_rfc3339().
+        // Previously used Local (Jakarta), causing mismatch 00:00–07:00 WIB → re-entry guard broken.
+        let today  = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let cutoff = (Local::now() - Duration::minutes(ecfg.max_signal_age_min)).format("%H:%M").to_string();
 
         let equity = get_equity(&client, &cfg).unwrap_or(116.0);
@@ -2573,7 +2575,8 @@ mod tests {
                 closed_at TEXT
             );
         ").unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        // Use UTC to match production closed_at format (Utc::now().to_rfc3339())
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         (conn, today)
     }
 

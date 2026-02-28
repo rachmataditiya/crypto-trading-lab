@@ -324,9 +324,12 @@ pub fn compute_hmtf(input: &HmtfInput) -> HmtfSignal {
         + 0.15 * tf_1h.score;
     let e_trend = gate_product * weighted_sum;
 
-    // Layer 6b: E_rev = D × max(tanh((35-RSI_1H)/10), 0.0) × max(tanh(ln(vol_ratio)), 0.0)
+    // Layer 6b: E_rev = D × max(tanh((45-RSI_1H)/10), 0.0) × max(tanh(ln(vol_ratio)), 0.0)
+    // RSI threshold raised from 35 → 45: oversold bounces are valid up to RSI=45.
+    // At RSI=36 (ETH bounce from 16), old formula returned 0 — completely missing the move.
+    // tanh((45-36)/10) = tanh(0.9) ≈ 0.716, which correctly weights a meaningful bounce.
     let rsi_1h = tf_1h.rsi;
-    let rsi_factor = ((35.0 - rsi_1h) / 10.0).tanh().max(0.0);
+    let rsi_factor = ((45.0 - rsi_1h) / 10.0).tanh().max(0.0);
     let vol_factor = if input.volume_ratio > 0.0 {
         input.volume_ratio.ln().tanh().max(0.0)
     } else {
@@ -357,11 +360,17 @@ pub fn compute_hmtf(input: &HmtfInput) -> HmtfSignal {
     //   align >= 2  : at least 2 TFs showing positive signal
     //   adx_1h > 28 : 1H trend is established, not choppy
     //   rsi_1h < 78 : not yet in exhaustion / overbought blowoff zone
-    let v_breakout = input.volume_ratio > 4.0
-        && tf_1h.score > 0.05
-        && alignment >= 2
+    // Tier V (Volume Breakout): strong volume surge + 1H momentum.
+    // Standard: vol > 4x + tf_1h > 0.05 + align >= 2 + adx > 28 + rsi < 78.
+    // High-vol override: vol > 5x only needs align >= 1 — fast oversold bounces
+    // recover 1H first while 4H/6H/12H lag. Missing these is the ETH-2026-03-01 bug.
+    let v_breakout = tf_1h.score > 0.05
         && adx_1h > 28.0
-        && rsi_1h < 78.0;
+        && rsi_1h < 78.0
+        && (
+            (input.volume_ratio > 4.0 && alignment >= 2)
+            || (input.volume_ratio > 5.0 && alignment >= 1)
+        );
 
     let tier = if rho > 0.6 {
         // Trending mode: A / B / V / C

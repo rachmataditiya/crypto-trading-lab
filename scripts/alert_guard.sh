@@ -6,7 +6,7 @@ BASE="/Users/rachmataditiya/.openclaw/workspace"
 DB="$BASE/data/trading-journal/sim_history.db"
 LIVE_DB="$BASE/data/trading-journal/live_positions.db"
 OPENCLAW=$(which openclaw 2>/dev/null || ls /Users/rachmataditiya/.local/bin/openclaw /usr/local/bin/openclaw 2>/dev/null | head -1)
-WA_TARGET="+6281268289854"
+TG_TARGET="84806079"
 NOW=$(TZ=Asia/Jakarta date '+%H:%M WIB')
 
 # ── Find unalerted PAPER_TRADE in last 15 minutes ────────────────────────────
@@ -101,8 +101,8 @@ if not oc:
     print(f"[{t_time}] ⚠️ openclaw not found, skipping alert")
 else:
     result = subprocess.run(
-        [oc, "message", "send", "--channel", "whatsapp",
-         "--target", "+6281268289854", "--message", msg],
+        [oc, "message", "send", "--channel", "telegram",
+         "--target", "84806079", "--message", msg],
         capture_output=True, text=True
     )
     if result.returncode == 0:
