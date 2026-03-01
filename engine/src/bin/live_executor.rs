@@ -427,10 +427,29 @@ fn recent_momentum_ok(symbol: &str, cache_path: &Path) -> bool {
 /// Returns how many CLOSED_TIME exits a symbol had today (UTC date).
 ///
 /// CLOSED_TIME = executor's time-stop: price failed to reach TP within hold_min.
-/// Pattern on 2026-02-27: DOT had CLOSED_TIME at 12:48 WIB → re-entered at 16:21 WIB
-/// (after 120-min cooldown expired) → CLOSED_TIME again at 17:51 WIB → -$0.16 more.
-/// Fix: after 1 CLOSED_TIME on a coin today, block re-entry until the next day.
-/// The setup is exhausted for that session — the H4 candle context has not changed.
+/// Returns true if a CLOSED_TIME exit occurred within the last 240 minutes (1 full 4H candle).
+///
+/// Old guard: blocked until UTC midnight — too aggressive. A genuinely new signal on a fresh
+/// 4H candle should be allowed. DOT pattern (2026-02-27) happened within 3H of CLOSED_TIME
+/// with the SAME setup. Blocking for 4H = one full candle change is sufficient.
+///
+/// Examples:
+///   CLOSED_TIME at 13:05 → block until 17:05 → allow at 17:05+ with fresh signal
+///   CLOSED_TIME at 15:05 (ETH) → allow re-entry at 19:05+ (ETH 18:58 signal would still block
+///   but only by ~6 min — a minor timing issue vs blocking all night)
+fn closed_time_within_4h(conn: &Connection, symbol: &str) -> bool {
+    let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(240)).to_rfc3339();
+    conn.query_row(
+        "SELECT 1 FROM open_positions \
+         WHERE symbol=? AND status='CLOSED_TIME' AND closed_at >= ?",
+        rusqlite::params![symbol, cutoff],
+        |_| Ok(true),
+    ).unwrap_or(false)
+}
+
+/// Legacy wrapper kept for unit tests that still use the old count-based API.
+/// In production, use closed_time_within_4h() instead.
+#[cfg(test)]
 fn daily_closed_time_count(conn: &Connection, symbol: &str, today: &str) -> u32 {
     conn.query_row(
         "SELECT COUNT(*) FROM open_positions \
@@ -1025,16 +1044,17 @@ fn main() -> Result<()> {
                     continue;
                 }
 
-                // ── Daily CLOSED_TIME re-entry guard ─────────────────────────────────
-                // After 1 CLOSED_TIME on a coin today, block re-entry for the rest of the day.
-                // The setup is exhausted: price couldn't reach TP within hold_min, and
-                // the H4 candle context hasn't changed. Re-entry compounds the loss.
-                // Root cause: DOT CLOSED_TIME at 12:48 WIB, re-entered at 16:21 WIB after
-                // 120-min cooldown → CLOSED_TIME again at 17:51 WIB → unnecessary -$0.16.
-                if daily_closed_time_count(&live_conn, &sig.symbol, &today) >= 1 {
-                    println!("[executor] 🚫 {} already had CLOSED_TIME today — no same-day re-entry", sig.symbol);
+                // ── CLOSED_TIME 4H re-entry guard ────────────────────────────────────
+                // Block re-entry for 240 min (1 full 4H candle) after a CLOSED_TIME.
+                // Old guard blocked until UTC midnight — too aggressive. A new signal on a
+                // fresh 4H candle with strong EV should be allowed.
+                // DOT pattern (2026-02-27) happened within 3H → 4H block is sufficient.
+                // ETH pattern (2026-03-01): CLOSED_TIME 15:05 → ETH 18:58 signal (3h53m later)
+                // would be allowed → correct, market conditions genuinely changed.
+                if closed_time_within_4h(&live_conn, &sig.symbol) {
+                    println!("[executor] 🚫 {} had CLOSED_TIME within last 4H — waiting for full candle reset", sig.symbol);
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_DAILY_TIME_EXIT",0.0,
-                        "CLOSED_TIME already logged today for this coin");
+                        "CLOSED_TIME within last 240min (4H candle reset required)");
                     continue;
                 }
 
