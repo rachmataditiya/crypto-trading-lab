@@ -372,28 +372,49 @@ pub fn compute_hmtf(input: &HmtfInput) -> HmtfSignal {
             || (input.volume_ratio > 5.0 && alignment >= 1)
         );
 
+    // Tier F (Fast/1H momentum): fires when 1H signal is very strong but higher TFs lag.
+    // Designed to catch fast oversold bounces early — addresses the "8 hour late entry" problem.
+    // Use case: ETH 2026-03-01 — 1H was very strong at RSI 25→45 but 4H/6H/12H still negative.
+    //
+    // Conditions (all must hold):
+    //   tf_1h.score > 0.15  : strong 1H bullish signal (not just noise)
+    //   rsi_1h in [20, 60]  : not overbought, not in freefall — valid bounce zone
+    //   vol >= 2.5x          : at least above-average volume (confirms the move)
+    //   alignment >= 1       : at least 1H itself positive (trivially true given score > 0.15)
+    //   adx_1h > 18.0        : some trend strength (relaxed vs Tier V's 28)
+    // Half Kelly + 45-min time-stop (same as Tier R/V — lower confidence).
+    let f_breakout = tf_1h.score > 0.15
+        && rsi_1h >= 20.0
+        && rsi_1h < 60.0
+        && input.volume_ratio >= 2.5
+        && adx_1h > 18.0;
+
     let tier = if rho > 0.6 {
-        // Trending mode: A / B / V / C
+        // Trending mode: A / B / V / F / C
         if e_trend > 0.30 && alignment >= 3 {
             'A'
         } else if e_trend > 0.15 && alignment >= 3 {
             'B'
         } else if v_breakout {
             'V'
+        } else if f_breakout {
+            'F'
         } else {
             'C'
         }
     } else if rho < 0.4 {
-        // Ranging mode: R / V / C
+        // Ranging mode: R / V / F / C
         if e_reversion > 0.08 && divergence_d > 0.15 {
             'R'
         } else if v_breakout {
             'V'
+        } else if f_breakout {
+            'F'
         } else {
             'C'
         }
     } else {
-        // Mixed (0.4 ≤ ρ ≤ 0.6): A / B / R / V / C
+        // Mixed (0.4 ≤ ρ ≤ 0.6): A / B / R / V / F / C
         // Tier B threshold is stricter in mixed (0.20 vs 0.15 in trending)
         // because regime conviction is lower — require stronger multi-TF signal.
         if e_trend > 0.30 && alignment >= 3 {
@@ -404,16 +425,19 @@ pub fn compute_hmtf(input: &HmtfInput) -> HmtfSignal {
             'R'
         } else if v_breakout {
             'V'
+        } else if f_breakout {
+            'F'
         } else {
             'C'
         }
     };
 
     // Layer 8: Kelly multiplier (base, before C_recent adjustment)
-    // Tier V gets half Kelly (same as R) — lower confidence than A/B.
+    // Tier F gets 0.3x Kelly — lowest confidence (1H only), highest noise risk.
     let kelly_multiplier = match tier {
         'A' | 'B' => 1.0,
         'R' | 'V' => 0.5,
+        'F'       => 0.3,
         _ => 0.0,
     };
 

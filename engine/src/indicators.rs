@@ -135,6 +135,8 @@ mod tests {
             ams_e_reversion: 0.0,
             ams_tier: 'C',
             ams_kelly_multiplier: 0.0,
+            ema20_1h: 0.0,
+            ema50_1h: 0.0,
         }
     }
 

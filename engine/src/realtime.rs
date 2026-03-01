@@ -79,8 +79,14 @@ pub struct SymbolState {
     /// Used by live-executor fast-crash guard: block entry if ret_1h < -3.0%.
     #[serde(default)]
     pub ret_1h:      f64,
-    pub ema20:       f64,
-    pub ema50:       f64,
+    pub ema20:       f64,  // 4H-based macro EMA20 (updates every 4H candle)
+    pub ema50:       f64,  // 4H-based macro EMA50
+    /// 1H-based EMA20 — updates every 1H candle. Used by Tier R/V/F for faster macro filter.
+    #[serde(default)]
+    pub ema20_1h:    f64,
+    /// 1H-based EMA50 — updates every 1H candle.
+    #[serde(default)]
+    pub ema50_1h:    f64,
     pub rsi14:       f64,
     pub atr14_pct:   f64,
     pub adx14:       f64,
@@ -536,9 +542,16 @@ fn recompute_indicators(state: &mut SymbolState) {
 
     state.indicator_tf = tf.to_string();
 
-    // EMA20 and EMA50
+    // EMA20 and EMA50 (4H-based macro trend — primary for Tier A/B)
     state.ema20 = ema_tail(&closes, 20).unwrap_or(state.price);
     state.ema50 = ema_tail(&closes, 50).unwrap_or(state.price);
+
+    // 1H-based EMA (faster macro filter for Tier R/V/F — updates every 1H candle)
+    if state.closes_1h.len() >= 20 {
+        let c1h: Vec<f64> = state.closes_1h.iter().copied().collect();
+        state.ema20_1h = ema_tail(&c1h, 20).unwrap_or(state.price);
+        state.ema50_1h = ema_tail(&c1h, 50).unwrap_or(state.price);
+    }
 
     // RSI14
     state.rsi14 = compute_rsi14(&closes);

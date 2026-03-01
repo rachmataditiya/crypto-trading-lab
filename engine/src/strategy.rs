@@ -91,7 +91,7 @@ pub fn evaluate(
         .coins
         .iter()
         .filter(|c| !open_symbols.contains(c.symbol.as_str()))
-        .filter(|c| matches!(c.ams_tier, 'A' | 'B' | 'R' | 'V'))
+        .filter(|c| matches!(c.ams_tier, 'A' | 'B' | 'R' | 'V' | 'F'))
         .collect();
 
     let (candidates, ams_selected): (Vec<&CoinData>, bool) = if !ams_candidates.is_empty() {
@@ -196,7 +196,15 @@ pub fn evaluate(
     // Tier V (volume breakout) also gets the relaxed check — it fires when 1H leads
     // higher TFs, so EMA50 catching up is expected.
     let is_reversion_tier = effective_tier == 'R' || effective_tier == 'V';
-    let pass_macro_ema = if is_reversion_tier {
+    let is_fast_tier = effective_tier == 'F';
+    let pass_macro_ema = if is_fast_tier {
+        // Tier F (1H momentum): use 1H EMA for macro check — updates every hour, not every 4H.
+        // This is the key fix for "8 hour late entry": 1H EMA recovers much faster than 4H.
+        // Requires price > ema20_1h AND ema20_1h > ema50_1h (1H bull stack).
+        let e20 = if best.ema20_1h > 0.0 { best.ema20_1h } else { best.ema20 };
+        let e50 = if best.ema50_1h > 0.0 { best.ema50_1h } else { best.ema50 };
+        best.price > e20 && e20 > e50
+    } else if is_reversion_tier {
         // Relaxed: just price above EMA20 (bouncing above short-term average)
         best.price > best.ema20
     } else {
@@ -363,7 +371,9 @@ pub fn evaluate(
         risk::adjusted_risk_pct(config, regime, confidence_label)
     };
     // Apply AMS kelly multiplier for R/V trades (half Kelly)
-    let risk_pct = if matches!(effective_tier, 'R' | 'V') && best.ams_kelly_multiplier > 0.0 {
+    let risk_pct = if is_fast_tier && best.ams_kelly_multiplier > 0.0 {
+        base_risk * best.ams_kelly_multiplier // 0.3x Kelly for Tier F (lowest confidence)
+    } else if matches!(effective_tier, 'R' | 'V') && best.ams_kelly_multiplier > 0.0 {
         base_risk * best.ams_kelly_multiplier
     } else {
         base_risk
@@ -373,8 +383,8 @@ pub fn evaluate(
     // Tier V is a 1H volume breakout — lower multi-TF confidence → same treatment as R.
     // min_expected_r check uses 1.0 floor for R/V (half Kelly already accounts for risk;
     // applying the full A/B min_expected_r threshold would always block them).
-    let expected_r = if matches!(effective_tier, 'R' | 'V') { 1.2 } else { 2.0 };
-    let min_er = if matches!(effective_tier, 'R' | 'V') { 1.0 } else { config.min_expected_r };
+    let expected_r = if is_fast_tier { 1.0 } else if matches!(effective_tier, 'R' | 'V') { 1.2 } else { 2.0 };
+    let min_er = if is_fast_tier { 0.8 } else if matches!(effective_tier, 'R' | 'V') { 1.0 } else { config.min_expected_r };
     if expected_r < min_er {
         return no_trade(
             hour_label,
@@ -719,6 +729,8 @@ mod tests {
             ams_e_reversion: 0.2,
             ams_tier,
             ams_kelly_multiplier: 1.0,
+            ema20_1h: 0.0,
+            ema50_1h: 0.0,
         }
     }
 
@@ -910,6 +922,8 @@ mod tests {
             ams_e_reversion: 0.1,
             ams_tier: 'A',
             ams_kelly_multiplier: 1.0,
+            ema20_1h: 0.0,
+            ema50_1h: 0.0,
         }
     }
 

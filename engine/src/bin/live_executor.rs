@@ -370,20 +370,37 @@ fn is_pump_or_exhausted(symbol: &str, cache_path: &Path, ecfg: &ExecutorConfig) 
 ///   Tier V also leads higher TFs, so EMA50 catching up is expected.
 ///   This mirrors the fix in strategy.rs `pass_macro_ema`.
 ///
-/// `is_reversion_tier`: true if AMS tier is R or V.
-fn macro_ema_aligned(symbol: &str, cache_path: &Path, is_reversion_tier: bool) -> bool {
+/// Check macro EMA alignment with tier-aware logic.
+///
+/// Tier A/B  : price > EMA20(4H) > EMA50(4H)  — strict, slow, reliable
+/// Tier R/V  : price > EMA20(4H)               — relaxed (mean-reversion bounces)
+/// Tier F    : price > EMA20(1H) > EMA50(1H)   — fast, uses 1H EMA (updates hourly)
+///
+/// Tier F uses 1H EMA so we can catch early bounces within the same hour
+/// instead of waiting for the 4H candle to update the macro trend.
+fn macro_ema_aligned(symbol: &str, cache_path: &Path, is_reversion_tier: bool, is_fast_tier: bool) -> bool {
     let cache_file = cache_path.join("trading-journal/realtime_cache.json");
     let text = match std::fs::read_to_string(&cache_file) { Ok(t) => t, Err(_) => return true };
     let d: serde_json::Value = match serde_json::from_str(&text) { Ok(v) => v, Err(_) => return true };
     let sym = &d["symbols"][symbol];
-    let price = sym["price"].as_f64().unwrap_or(0.0);
-    let ema20 = sym["ema20"].as_f64().unwrap_or(0.0);
-    let ema50 = sym["ema50"].as_f64().unwrap_or(0.0);
-    if ema20 <= 0.0 || ema50 <= 0.0 { return true; } // warm-up not done — allow
-    if is_reversion_tier {
-        price > ema20  // relaxed: bounce above short-term average is enough
+    let price  = sym["price"].as_f64().unwrap_or(0.0);
+    let ema20  = sym["ema20"].as_f64().unwrap_or(0.0);
+    let ema50  = sym["ema50"].as_f64().unwrap_or(0.0);
+    let e20_1h = sym["ema20_1h"].as_f64().unwrap_or(0.0);
+    let e50_1h = sym["ema50_1h"].as_f64().unwrap_or(0.0);
+
+    if is_fast_tier {
+        // Use 1H EMA — falls back to 4H if 1H not yet computed
+        let e20 = if e20_1h > 0.0 { e20_1h } else { ema20 };
+        let e50 = if e50_1h > 0.0 { e50_1h } else { ema50 };
+        if e20 <= 0.0 || e50 <= 0.0 { return true; }
+        price > e20 && e20 > e50
+    } else if is_reversion_tier {
+        if ema20 <= 0.0 { return true; }
+        price > ema20
     } else {
-        price > ema20 && ema20 > ema50  // strict: full bull stack for trend trades
+        if ema20 <= 0.0 || ema50 <= 0.0 { return true; }
+        price > ema20 && ema20 > ema50
     }
 }
 
@@ -690,6 +707,7 @@ fn init_live_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN p_up REAL", params![]);
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN high_water REAL DEFAULT 0", params![]);
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN closed_at TEXT", params![]);
+    let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN ams_tier TEXT DEFAULT 'X'", params![]);
     Ok(())
 }
 
@@ -753,13 +771,14 @@ fn total_risk_deployed(conn: &Connection, equity: f64) -> f64 {
 
 fn open_position(conn: &Connection, sig_id: i64, order_id: &str, symbol: &str,
                  direction: &str, qty: f64, fill: f64, stop: f64, tp1: f64, risk_usdt: f64,
-                 tp2: f64, p_up: f64) {
+                 tp2: f64, p_up: f64, ams_tier: char) {
     let now = Utc::now().to_rfc3339();
+    let tier_str = ams_tier.to_string();
     let _ = conn.execute(
         "INSERT INTO open_positions
-         (signal_id,order_id,symbol,direction,qty,entry_price,stop_price,tp1_price,risk_usdt,opened_at,tp2_price,p_up)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![sig_id,order_id,symbol,direction,qty,fill,stop,tp1,risk_usdt,now,tp2,p_up]);
+         (signal_id,order_id,symbol,direction,qty,entry_price,stop_price,tp1_price,risk_usdt,opened_at,tp2_price,p_up,ams_tier)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![sig_id,order_id,symbol,direction,qty,fill,stop,tp1,risk_usdt,now,tp2,p_up,tier_str]);
 }
 
 fn get_daily_stats(conn: &Connection, today: &str, starting_equity: f64) -> (f64, i64, u32, bool) {
@@ -986,7 +1005,8 @@ fn main() -> Result<()> {
                     .and_then(|s| s.chars().next())
                     .unwrap_or('C');
                 let is_reversion_tier = ams_tier_char == 'R' || ams_tier_char == 'V';
-                if !macro_ema_aligned(&sig.symbol, &base.join("../.."), is_reversion_tier) {
+                let is_fast_tier = ams_tier_char == 'F';
+                if !macro_ema_aligned(&sig.symbol, &base.join("../.."), is_reversion_tier, is_fast_tier) {
                     println!("[executor] ⛔ Macro EMA DOWN: {} — skip LONG in downtrend", sig.symbol);
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_EMA_DOWN",0.0,
                         "price<ema20 or ema20<ema50 (4H macro bearish)");
@@ -1096,7 +1116,7 @@ fn main() -> Result<()> {
                             place_sl(&client, &cfg, &inst, actual_qty, actual_stop);
                             open_position(&live_conn, sig_id, &order_id, &sig.symbol,
                                           &sig.direction, actual_qty, fill, actual_stop, actual_tp1, risk_usdt,
-                                          actual_tp2, p_up_val);
+                                          actual_tp2, p_up_val, ams_tier_char);
                             live_conn.execute(
                                 "UPDATE daily_stats SET trade_count=trade_count+1 WHERE trade_date=?",
                                 params![today]).ok();
@@ -1119,20 +1139,21 @@ fn main() -> Result<()> {
         }
 
         // ── Monitor open positions ────────────────────────────────────────────
-        let open_pos: Vec<(i64,i64,String,String,f64,f64,f64,f64,f64,String,f64,i64,f64)> = {
+        let open_pos: Vec<(i64,i64,String,String,f64,f64,f64,f64,f64,String,f64,i64,f64,String)> = {
             let mut s = live_conn.prepare(
                 "SELECT id,signal_id,symbol,direction,qty,entry_price,stop_price,tp1_price,risk_usdt,opened_at,
-                        COALESCE(tp2_price,0.0),COALESCE(half_exited,0),COALESCE(high_water,0.0)
+                        COALESCE(tp2_price,0.0),COALESCE(half_exited,0),COALESCE(high_water,0.0),
+                        COALESCE(ams_tier,'X')
                  FROM open_positions WHERE status='OPEN'")?;
             let x: Vec<_> = s.query_map(params![], |r| Ok((
                 r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,
                 r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,
-                r.get(10)?,r.get(11)?,r.get(12)?
+                r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?
             )))?.filter_map(|r| r.ok()).collect();
             x
         };
 
-        for (pid, sig_id, symbol, direction, qty, entry, stop, tp1, _risk, opened_at_str, tp2, half_exited, mut high_water) in open_pos {
+        for (pid, sig_id, symbol, direction, qty, entry, stop, tp1, _risk, opened_at_str, tp2, half_exited, mut high_water, pos_tier) in open_pos {
             let inst    = inst_id(&symbol);
             let current = match get_price(&client, &inst) { Ok(p) => p, Err(_) => continue };
             let opened_dt = DateTime::parse_from_rfc3339(&opened_at_str)
@@ -1248,7 +1269,8 @@ fn main() -> Result<()> {
                 else { println!("[executor] ⚠️  Trail sell failed — retrying"); (false, 0.0, "", String::new()) }
 
             // ── Time exit ─────────────────────────────────────────────────────
-            } else if hold_min >= max_hold_min(&ecfg, &symbol) {
+            // Tier F (1H fast momentum): 45-min hold — 1H signals expire faster than 4H
+            } else if hold_min >= (if pos_tier == "F" { 45 } else { max_hold_min(&ecfg, &symbol) }) {
                 cancel_pending_algos(&client, &cfg, &inst);
                 let p = (current - entry) * qty;
                 println!("[executor] ⏱️  Time exit {} {}min @ {:.4}", symbol, hold_min, current);
@@ -2441,7 +2463,7 @@ mod tests {
         // price=100 > ema20=95 > ema50=88 → bull stack → allow (trend mode)
         let dir = tempfile::tempdir().unwrap();
         write_cache_with_emas(&dir, "SOLUSDT", 100.0, 95.0, 88.0);
-        assert!(macro_ema_aligned("SOLUSDT", dir.path(), false),
+        assert!(macro_ema_aligned("SOLUSDT", dir.path(), false, false),
             "Bull stack (price>EMA20>EMA50) must be allowed");
     }
 
@@ -2450,9 +2472,9 @@ mod tests {
         // price=82 < ema20=87 → block even in reversion mode
         let dir = tempfile::tempdir().unwrap();
         write_cache_with_emas(&dir, "SOLUSDT", 82.0, 87.0, 92.0);
-        assert!(!macro_ema_aligned("SOLUSDT", dir.path(), false),
+        assert!(!macro_ema_aligned("SOLUSDT", dir.path(), false, false),
             "Bear stack (price<EMA20<EMA50) must be blocked — 2026-02-27 SOL pattern");
-        assert!(!macro_ema_aligned("SOLUSDT", dir.path(), true),
+        assert!(!macro_ema_aligned("SOLUSDT", dir.path(), true, false),
             "Price below EMA20 must be blocked even in reversion mode (no bounce yet)");
     }
 
@@ -2462,9 +2484,9 @@ mod tests {
         // Trend mode: blocked. Reversion mode: allowed (price > EMA20 is enough).
         let dir = tempfile::tempdir().unwrap();
         write_cache_with_emas(&dir, "SOLUSDT", 90.0, 88.0, 92.0);
-        assert!(!macro_ema_aligned("SOLUSDT", dir.path(), false),
+        assert!(!macro_ema_aligned("SOLUSDT", dir.path(), false, false),
             "Death cross (EMA20<EMA50) must be blocked in trend mode");
-        assert!(macro_ema_aligned("SOLUSDT", dir.path(), true),
+        assert!(macro_ema_aligned("SOLUSDT", dir.path(), true, false),
             "Tier R/V: price>EMA20 is sufficient even if EMA20<EMA50 (oversold bounce)");
     }
 
@@ -2474,9 +2496,9 @@ mod tests {
         // Old code: blocked. New code Tier R: allowed.
         let dir = tempfile::tempdir().unwrap();
         write_cache_with_emas(&dir, "ETHUSDT", 1977.0, 1947.0, 1953.0);
-        assert!(!macro_ema_aligned("ETHUSDT", dir.path(), false),
+        assert!(!macro_ema_aligned("ETHUSDT", dir.path(), false, false),
             "Trend mode must block ETH death cross");
-        assert!(macro_ema_aligned("ETHUSDT", dir.path(), true),
+        assert!(macro_ema_aligned("ETHUSDT", dir.path(), true, false),
             "Tier R must allow ETH bounce — this is the 2026-03-01 missed trade");
     }
 
@@ -2485,7 +2507,7 @@ mod tests {
         // Symbol not in cache → default 0.0 → zero EMA → fail-open (allow)
         let dir = tempfile::tempdir().unwrap();
         write_cache_with_emas(&dir, "BTCUSDT", 100.0, 95.0, 88.0);
-        assert!(macro_ema_aligned("XRPUSDT", dir.path(), false),
+        assert!(macro_ema_aligned("XRPUSDT", dir.path(), false, false),
             "Missing symbol in cache must fail-open (allow)");
     }
 
@@ -2493,7 +2515,7 @@ mod tests {
     fn macro_ema_aligned_no_cache_file_allowed() {
         // Cache file doesn't exist → fail-open (allow) — other guards still active
         let dir = tempfile::tempdir().unwrap();
-        assert!(macro_ema_aligned("SOLUSDT", dir.path(), false),
+        assert!(macro_ema_aligned("SOLUSDT", dir.path(), false, false),
             "Missing cache file must fail-open (allow)");
     }
 

@@ -10,8 +10,10 @@ pub struct CoinData {
     pub ret_24h: f64,
     pub ret_3d: f64,
     pub ret_7d: f64,
-    pub ema20: f64,
-    pub ema50: f64,
+    pub ema20: f64,     // 4H-based EMA20
+    pub ema50: f64,     // 4H-based EMA50
+    pub ema20_1h: f64,  // 1H-based EMA20 (faster macro filter)
+    pub ema50_1h: f64,  // 1H-based EMA50
     pub rsi14: f64,
     pub atr14_pct: f64,
     pub adx14: f64,

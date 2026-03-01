@@ -37,6 +37,8 @@ pub fn parse_realtime_cache(
         .map(|s| {
             let ema20 = if s.ema20 > 0.0 { s.ema20 } else { s.price };
             let ema50 = if s.ema50 > 0.0 { s.ema50 } else { s.price };
+            let ema20_1h = if s.ema20_1h > 0.0 { s.ema20_1h } else { ema20 }; // fallback to 4H
+            let ema50_1h = if s.ema50_1h > 0.0 { s.ema50_1h } else { ema50 };
             let rsi14 = if s.rsi14 > 0.0 { s.rsi14 } else { 50.0 };
             let atr14_pct = if s.atr14_pct > 0.0 { s.atr14_pct } else { 1.0 };
             let adx14 = if s.adx14 > 0.0 { s.adx14 } else { 20.0 };
@@ -52,6 +54,8 @@ pub fn parse_realtime_cache(
                 ret_7d: sanitize::ret_pct(s.ret_7d),
                 ema20,
                 ema50,
+                ema20_1h,
+                ema50_1h,
                 rsi14: rsi14.clamp(0.0, 100.0),
                 atr14_pct: atr14_pct.clamp(0.0, 50.0),
                 adx14: sanitize::adx(adx14),
@@ -254,6 +258,8 @@ fn parse_scan_content(content: &str) -> Result<MarketSnapshot, String> {
                 ret_7d: sanitize::ret_pct(r7d),
                 ema20,
                 ema50,
+                ema20_1h: ema20, // legacy scan: no 1H data, fall back to 4H
+                ema50_1h: ema50,
                 rsi14: rsi.clamp(0.0, 100.0),
                 atr14_pct: atr_pct.clamp(0.0, 50.0),
                 adx14: sanitize::adx(adx),
