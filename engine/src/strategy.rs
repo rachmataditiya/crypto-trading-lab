@@ -120,15 +120,21 @@ pub fn evaluate(
         );
     }
 
-    // Pick best: AMS path → rank by entry score; Bayesian path → rank by score
-    let best = if ams_selected {
-        candidates.iter()
-            .max_by(|a, b| a.hmtf_entry_score.partial_cmp(&b.hmtf_entry_score)
-                .unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap()
+    // Sort candidates: AMS path → by entry score desc; Bayesian path → by score desc
+    // We try each candidate in order until one passes ALL quality gates (waterfall).
+    // Previously only top-1 was tried — if it failed volume/EMA gate, NO_TRADE was
+    // returned even if the next candidate would have passed. Bug: DOT (score 0.084)
+    // blocked SOL (score 0.000245, vol 6x) when DOT had vol=1.29x < min.
+    let mut sorted_candidates: Vec<&CoinData> = candidates.clone();
+    if ams_selected {
+        sorted_candidates.sort_by(|a, b|
+            b.hmtf_entry_score.partial_cmp(&a.hmtf_entry_score)
+                .unwrap_or(std::cmp::Ordering::Equal));
     } else {
-        candidates.iter().max_by_key(|c| c.score).unwrap()
-    };
+        sorted_candidates.sort_by_key(|c| std::cmp::Reverse(c.score));
+    }
+    // best starts as top candidate; inner loop may advance to next
+    let best = sorted_candidates[0];
     let confidence_label = indicators::confidence_label(best.score, best.volume_ratio);
     let prob = compute_probability(regime, best, news_context);
 
@@ -320,6 +326,48 @@ pub fn evaluate(
         && pass_macro_ema;
 
     if !full_gate_pass {
+        // Waterfall: try next candidate before giving up.
+        // Skip index 0 (already tried as `best`), iterate rest in score order.
+        for next in sorted_candidates.iter().skip(1) {
+            let n_prob  = compute_probability(regime, next, news_context);
+            let n_conf  = indicators::confidence_label(next.score, next.volume_ratio);
+            let n_tier  = if next.ams_tier != 'C' { next.ams_tier } else { next.hmtf_tier };
+            let n_hmtf_ok = next.hmtf_entry_score != 0.0 || next.ams_tier != 'C';
+            let n_gate_ok = !n_hmtf_ok || n_tier != 'C';
+            let n_is_rev  = n_tier == 'R' || n_tier == 'V';
+            let n_is_fast = n_tier == 'F';
+            let n_pass_ema = if n_is_fast {
+                let e20 = if next.ema20_1h > 0.0 { next.ema20_1h } else { next.ema20 };
+                let e50 = if next.ema50_1h > 0.0 { next.ema50_1h } else { next.ema50 };
+                next.price > e20 && e20 > e50
+            } else if n_is_rev {
+                next.price > next.ema20
+            } else {
+                next.price > next.ema20 && next.ema20 > next.ema50
+            };
+            let n_vol_min = volume_gate_threshold(&config.preset, &regime);
+            let n_pass = pass_regime
+                && next.score >= min_score
+                && next.volume_ratio >= n_vol_min
+                && next.adx14 >= min_adx
+                && n_conf != "weak"
+                && n_prob.confidence >= 0.55 && n_prob.expected_value_r > 0.0
+                && n_gate_ok
+                && n_pass_ema;
+            if n_pass {
+                // Recurse with a snapshot containing only this candidate as top coin.
+                // Simpler: rebuild a mini snapshot and re-evaluate.
+                // Fastest: create a new snapshot with next as the only coin, re-call evaluate.
+                let mut mini = snapshot.clone();
+                // Move next to front so evaluate() picks it as best
+                mini.coins.retain(|c| c.symbol != next.symbol);
+                mini.coins.insert(0, (*next).clone());
+                // Also remove the failed best so it doesn't re-appear
+                mini.coins.retain(|c| c.symbol != best.symbol);
+                return evaluate(&mini, signal, news_context, state, config);
+            }
+        }
+        // All candidates exhausted
         return no_trade(
             hour_label,
             regime,
