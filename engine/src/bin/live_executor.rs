@@ -290,12 +290,25 @@ fn compute_sl_tp_from_fill(sig_entry: f64, sig_stop: f64, sig_tp1: f64, fill: f6
     (sl, tp)
 }
 
-/// Dynamic TP1 multiplier based on signal confidence (P(up)).
-/// High-confidence signals deserve a wider TP target.
-/// p_up >= 0.92 → 2× ATR | p_up >= 0.85 → 1.5× ATR | else → 1× ATR
-fn compute_dynamic_tp1(entry: f64, sl: f64, p_up: f64) -> f64 {
+/// Dynamic TP1 multiplier based on tier + signal confidence (P(up)).
+///
+/// Tier A/B (trend): high conviction, wide target → 1.5–2.0× ATR
+/// Tier R/V/F (reversion/breakout/fast): entry is already late or 1H-only.
+///   ATR is measured from a wide SL (full candle swing) → raw ATR% can be 5–6%.
+///   Using 2× ATR pushes TP1 to +10–13% — unreachable in 60–120 min.
+///   Cap at 1.0× ATR so TP1 ≈ entry + 4–5% → realistic for 90-min hold.
+///
+/// Example (SOL Tier V): entry $85.95, SL $80.43 → ATR=6.4%
+///   Old (2×): TP1 = $85.95 × 1.128 = $96.98 (+13%) → never reached → CLOSED_TIME
+///   New (1×): TP1 = $85.95 × 1.064 = $91.43 (+6.4%) → reachable in 90 min
+fn compute_dynamic_tp1(entry: f64, sl: f64, p_up: f64, ams_tier: char) -> f64 {
     let atr_pct = ((entry - sl).abs() / entry.max(1e-9)).max(0.015);
-    let multiplier: f64 = if p_up >= 0.92 { 2.0 } else if p_up >= 0.85 { 1.5 } else { 1.0 };
+    let multiplier: f64 = match ams_tier {
+        // Reversion / breakout / fast tiers: entry already late, cap TP at 1× ATR
+        'R' | 'V' | 'F' => 1.0,
+        // Trend tiers: scale by confidence
+        _ => if p_up >= 0.92 { 2.0 } else if p_up >= 0.85 { 1.5 } else { 1.0 },
+    };
     (entry * (1.0 + atr_pct * multiplier) * 1_000_000.0).round() / 1_000_000.0
 }
 
@@ -1095,9 +1108,9 @@ fn main() -> Result<()> {
                             (s, t)
                         } else { (sig.stop, sig.tp1) };
 
-                        // Step 2: Dynamic TP1 scaling based on P(up) confidence
+                        // Step 2: Dynamic TP1 scaling based on tier + P(up) confidence
                         let p_up_val = sig.p_up.unwrap_or(0.5);
-                        let actual_tp1 = compute_dynamic_tp1(fill, base_stop, p_up_val);
+                        let actual_tp1 = compute_dynamic_tp1(fill, base_stop, p_up_val, ams_tier_char);
                         let actual_stop = base_stop;
                         if actual_tp1 != base_tp1 {
                             let mult = if p_up_val >= 0.92 { "2.0×" } else { "1.5×" };
@@ -1676,7 +1689,7 @@ mod tests {
     fn dynamic_tp_low_pup_uses_1x() {
         // p_up < 0.85 → 1× ATR multiplier
         // entry=100, sl=97 (3% stop) → tp = 100*(1+0.03*1) = 103.0
-        let tp = compute_dynamic_tp1(100.0, 97.0, 0.80);
+        let tp = compute_dynamic_tp1(100.0, 97.0, 0.80, 'A');
         let expected = 100.0 * (1.0 + 0.03);
         assert!((tp - expected).abs() < 0.01, "1× ATR: got {:.4} expected {:.4}", tp, expected);
     }
@@ -1685,7 +1698,7 @@ mod tests {
     fn dynamic_tp_medium_pup_uses_1_5x() {
         // p_up 0.85-0.92 → 1.5× ATR multiplier
         // entry=100, sl=97 (3% stop) → tp = 100*(1+0.03*1.5) = 104.5
-        let tp = compute_dynamic_tp1(100.0, 97.0, 0.87);
+        let tp = compute_dynamic_tp1(100.0, 97.0, 0.87, 'A');
         let expected = 100.0 * (1.0 + 0.03 * 1.5);
         assert!((tp - expected).abs() < 0.01, "1.5× ATR: got {:.4} expected {:.4}", tp, expected);
     }
@@ -1694,7 +1707,7 @@ mod tests {
     fn dynamic_tp_high_pup_uses_2x() {
         // p_up >= 0.92 → 2× ATR multiplier
         // entry=100, sl=97 (3% stop) → tp = 100*(1+0.03*2) = 106.0
-        let tp = compute_dynamic_tp1(100.0, 97.0, 0.93);
+        let tp = compute_dynamic_tp1(100.0, 97.0, 0.93, 'A');
         let expected = 100.0 * (1.0 + 0.03 * 2.0);
         assert!((tp - expected).abs() < 0.01, "2× ATR: got {:.4} expected {:.4}", tp, expected);
     }
@@ -1702,9 +1715,28 @@ mod tests {
     #[test]
     fn dynamic_tp_always_above_entry() {
         for &p_up in &[0.5, 0.80, 0.87, 0.93, 0.99] {
-            let tp = compute_dynamic_tp1(100.0, 97.0, p_up);
+            let tp = compute_dynamic_tp1(100.0, 97.0, p_up, 'A');
             assert!(tp > 100.0, "TP {:.4} must be above entry 100 for p_up={}", tp, p_up);
         }
+    }
+
+    #[test]
+    fn dynamic_tp_tier_v_capped_at_1x() {
+        // Tier V/R/F always use 1x ATR regardless of P(up)
+        // SOL case: entry=85.95, sl=80.43 → atr_pct=6.42% → tp1 = 91.46
+        // Old (2x ATR with p_up=0.93): tp1 = 96.98 (unreachable in 90 min)
+        let entry = 85.95_f64; let sl = 80.43_f64; let p_up = 0.93_f64;
+        let tp_v = compute_dynamic_tp1(entry, sl, p_up, 'V');
+        let tp_a = compute_dynamic_tp1(entry, sl, p_up, 'A');
+        let atr_pct = (entry - sl) / entry;
+        let expected_1x = entry * (1.0 + atr_pct);
+        assert!((tp_v - expected_1x).abs() < 0.01,
+            "Tier V TP {:.4} should be 1x ATR ({:.4})", tp_v, expected_1x);
+        assert!(tp_a > tp_v, "Tier A TP {:.4} should be > Tier V TP {:.4}", tp_a, tp_v);
+        let tp_r = compute_dynamic_tp1(entry, sl, p_up, 'R');
+        let tp_f = compute_dynamic_tp1(entry, sl, p_up, 'F');
+        assert!((tp_r - expected_1x).abs() < 0.01, "Tier R capped at 1x");
+        assert!((tp_f - expected_1x).abs() < 0.01, "Tier F capped at 1x");
     }
 
     // ════════════════════════════════════════════════════════════════
