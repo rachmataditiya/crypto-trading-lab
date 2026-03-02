@@ -450,6 +450,23 @@ fn recent_momentum_ok(symbol: &str, cache_path: &Path) -> bool {
 ///   CLOSED_TIME at 13:05 → block until 17:05 → allow at 17:05+ with fresh signal
 ///   CLOSED_TIME at 15:05 (ETH) → allow re-entry at 19:05+ (ETH 18:58 signal would still block
 ///   but only by ~6 min — a minor timing issue vs blocking all night)
+/// Returns true if the last closed trade today was profitable (CLOSED_TP or CLOSED_TP2).
+/// Used by Filter 3: allow more trades only if previous exit was a win.
+/// If last exit was CLOSED_TIME or CLOSED_SL → market choppy/adverse → pause.
+fn last_trade_was_profit(conn: &Connection, today: &str) -> bool {
+    let result: Option<String> = conn.query_row(
+        "SELECT status FROM open_positions \
+         WHERE date(closed_at)=? AND closed_at IS NOT NULL \
+         ORDER BY closed_at DESC LIMIT 1",
+        rusqlite::params![today],
+        |r| r.get(0),
+    ).ok();
+    match result.as_deref() {
+        Some("CLOSED_TP") | Some("CLOSED_TP2") => true,
+        _ => false,
+    }
+}
+
 fn closed_time_within_4h(conn: &Connection, symbol: &str) -> bool {
     let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(240)).to_rfc3339();
     conn.query_row(
@@ -1071,17 +1088,23 @@ fn main() -> Result<()> {
                     continue;
                 }
 
-                // ── Filter 3: Max 1 trade per day ────────────────────────────
-                // Over-trading amplifies losses in choppy markets.
-                // 13 CLOSED_TIMEs happened because: trade 1 → CLOSED_TIME → trade 2 same
-                // conditions → CLOSED_TIME again. If market is choppy for first trade,
-                // it stays choppy for the next one too.
-                // Allow only 1 FILLED trade per UTC day. Best setup of the day wins.
+                // ── Filter 3: Stop after non-profitable exit ──────────────
+                // Over-trading in choppy markets compounds losses.
+                // Logic: if today's last closed trade was NOT profitable (CLOSED_TIME or
+                // CLOSED_SL) → market is choppy/adverse → stop for the day.
+                // If last exit was CLOSED_TP / CLOSED_TP2 → market is trending → allow
+                // more trades (market condition confirmed good).
+                // No trade today yet (trade_count=0) → always allow first trade.
                 if trade_count >= 1 {
-                    println!("[executor] 🚫 Max 1 trade/day reached (trade_count={}) — skip", trade_count);
-                    mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_MAX_DAILY",0.0,
-                        "max 1 trade per day — best setup already taken");
-                    continue;
+                    let last_was_profit = last_trade_was_profit(&live_conn, &today);
+                    if !last_was_profit {
+                        println!("[executor] 🚫 Last trade today was not profitable — pause rest of day (trade_count={})", trade_count);
+                        mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_MAX_DAILY",0.0,
+                            "last trade today was CLOSED_TIME/SL — market choppy, pausing");
+                        continue;
+                    }
+                    // Last trade was TP → market trending → allow next trade
+                    println!("[executor] ✅ Last trade today was profitable — allowing trade #{}", trade_count + 1);
                 }
 
                 // ── Kelly-sized position ──────────────────────────────────────
