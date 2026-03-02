@@ -874,7 +874,7 @@ fn main() -> Result<()> {
         let cutoff = (Local::now() - Duration::minutes(ecfg.max_signal_age_min)).format("%H:%M").to_string();
 
         let equity = get_equity(&client, &cfg).unwrap_or(116.0);
-        let (realized_pnl, consec_losses, _tc, cb_hit) = get_daily_stats(&live_conn, &today, equity);
+        let (realized_pnl, consec_losses, trade_count, cb_hit) = get_daily_stats(&live_conn, &today, equity);
 
         let drawdown = if equity > 0.0 { -realized_pnl / equity } else { 0.0 };
         let risk_ok  = is_risk_ok(cb_hit, consec_losses, drawdown, cb_losses, max_dd);
@@ -1068,6 +1068,19 @@ fn main() -> Result<()> {
                     println!("[executor] 🚫 {} had CLOSED_TIME within last 4H — waiting for full candle reset", sig.symbol);
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_DAILY_TIME_EXIT",0.0,
                         "CLOSED_TIME within last 240min (4H candle reset required)");
+                    continue;
+                }
+
+                // ── Filter 3: Max 1 trade per day ────────────────────────────
+                // Over-trading amplifies losses in choppy markets.
+                // 13 CLOSED_TIMEs happened because: trade 1 → CLOSED_TIME → trade 2 same
+                // conditions → CLOSED_TIME again. If market is choppy for first trade,
+                // it stays choppy for the next one too.
+                // Allow only 1 FILLED trade per UTC day. Best setup of the day wins.
+                if trade_count >= 1 {
+                    println!("[executor] 🚫 Max 1 trade/day reached (trade_count={}) — skip", trade_count);
+                    mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_MAX_DAILY",0.0,
+                        "max 1 trade per day — best setup already taken");
                     continue;
                 }
 

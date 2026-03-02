@@ -203,6 +203,42 @@ pub fn evaluate(
     // higher TFs, so EMA50 catching up is expected.
     let is_reversion_tier = effective_tier == 'R' || effective_tier == 'V';
     let is_fast_tier = effective_tier == 'F';
+
+    // ── Filter 1: BTC Macro Filter ─────────────────────────────────────────
+    // Crypto moves together. If BTC is choppy/sideways, all coins are choppy.
+    // Require BTC EMA20 > EMA50 (4H bull stack) AND ADX > 25 (clearly trending).
+    // Exception: Tier R/V/F — enters on dips/bounces, BTC ADX will be low at entry.
+    //   Only require BTC EMA alignment (not ADX) for reversion/breakout tiers.
+    let pass_btc_macro = {
+        let btc = snapshot.coins.iter().find(|c| c.symbol == "BTCUSDT");
+        match btc {
+            None => true, // BTC not in snapshot — don't block
+            Some(b) => {
+                let btc_ema_ok = b.ema20 > b.ema50;
+                let btc_adx_ok = b.adx14 >= 25.0;
+                if is_reversion_tier || is_fast_tier {
+                    btc_ema_ok // Tier R/V/F: EMA only
+                } else {
+                    btc_ema_ok && btc_adx_ok // Tier A/B: full trending filter
+                }
+            }
+        }
+    };
+
+    // ── Filter 2: ρ Hard Floor ─────────────────────────────────────────────
+    // MIXED zone (ρ 0.45–0.55) = choppy market = CLOSED_TIME trap.
+    // All 13 recent CLOSED_TIMEs happened in MIXED regime (ρ=0.44–0.57).
+    // Hard floor forces entry only when market has clear direction.
+    let pass_rho = {
+        let rho = best.ams_regime_rho;
+        match effective_tier {
+            'A' | 'B' => rho > 0.55,  // clearly trending
+            'R'       => rho < 0.45,  // clearly ranging (reversion)
+            'V' | 'F' => rho > 0.50,  // some momentum present
+            _         => true,
+        }
+    };
+
     let pass_macro_ema = if is_fast_tier {
         // Tier F (1H momentum): use 1H EMA for macro check — updates every hour, not every 4H.
         // This is the key fix for "8 hour late entry": 1H EMA recovers much faster than 4H.
@@ -227,15 +263,17 @@ pub fn evaluate(
         pass_probability,
         hmtf_gate_ok,
         pass_macro_ema,
+        pass_btc_macro,
+        pass_rho,
     ]
     .iter()
     .filter(|&&x| x)
     .count();
     let setup_grade = match checklist_pass_count {
-        8 => "A",
-        7 => "B",
-        6 => "C",
-        _ => "D",
+        10 => "A",
+        9  => "B",
+        8  => "C",
+        _  => "D",
     };
 
     let vol_tier = indicators::volume_tier(best.volume_ratio);
@@ -293,10 +331,20 @@ pub fn evaluate(
             best.ema20,
             best.ema50,
         ),
+        format!(
+            "BTC macro filter (ema20>ema50 + adx>=25 for A/B): {}",
+            mark(pass_btc_macro),
+        ),
+        format!(
+            "Regime ρ floor (A/B>0.55, R<0.45, V/F>0.50): {} (ρ={:.2}, tier={})",
+            mark(pass_rho),
+            best.ams_regime_rho,
+            effective_tier,
+        ),
     ];
 
     let quality_gate = format!(
-        "gate(grade={},regime={},score={},volume={},adx={},confidence={},prob={},macro_ema={});bayes(prior={:.2},tech={:.2},news={:.2},post={:.2});ams={},ams_regime={:.2},ams_div={:.3},sel={}",
+        "gate(grade={},regime={},score={},volume={},adx={},confidence={},prob={},macro_ema={},btc_macro={},rho={});bayes(prior={:.2},tech={:.2},news={:.2},post={:.2});ams={},ams_regime={:.2},ams_div={:.3},sel={}",
         setup_grade,
         pass_regime,
         pass_score,
@@ -305,6 +353,8 @@ pub fn evaluate(
         pass_confidence,
         pass_probability,
         pass_macro_ema,
+        pass_btc_macro,
+        pass_rho,
         prob.prior_up,
         prob.tech_likelihood,
         prob.news_likelihood,
@@ -315,7 +365,7 @@ pub fn evaluate(
         if ams_selected { "ams" } else { "bayes" },
     );
 
-    // All 8 gates must pass — no bypass. Aggressive mode already has looser thresholds.
+    // All 10 gates must pass — no bypass.
     let full_gate_pass = pass_regime
         && pass_score
         && pass_volume
@@ -323,7 +373,9 @@ pub fn evaluate(
         && pass_confidence
         && pass_probability
         && hmtf_gate_ok
-        && pass_macro_ema;
+        && pass_macro_ema
+        && pass_btc_macro
+        && pass_rho;
 
     if !full_gate_pass {
         // Waterfall: try next candidate before giving up.
