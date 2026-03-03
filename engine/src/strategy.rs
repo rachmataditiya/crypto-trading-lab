@@ -239,6 +239,24 @@ pub fn evaluate(
         }
     };
 
+    // ── Tier R: 4H RSI Oversold Gate ───────────────────────────────────────
+    // Mean-reversion (Tier R) only makes sense when the coin is genuinely
+    // oversold on the 4H timeframe. If 4H RSI > 50, there's no meaningful
+    // suppression to revert from — the bounce will be weak and likely
+    // won't reach TP1 within the hold window → CLOSED_TIME.
+    //
+    // Example: SOL 2026-03-03, Tier R, 4H RSI=53, entry $85.83 → CLOSED_TIME
+    // 1H RSI was ~38 (1H oversold) but 4H neutral → weak bounce → time-stop.
+    //
+    // Fix: require 4H RSI < 50 for Tier R entries.
+    // This does NOT apply to Tier V/F — those are volume/momentum-based,
+    // not RSI mean-reversion.
+    let pass_rsi_reversion = if effective_tier == 'R' {
+        best.rsi14 < 50.0
+    } else {
+        true
+    };
+
     let pass_macro_ema = if is_fast_tier {
         // Tier F (1H momentum): use 1H EMA for macro check — updates every hour, not every 4H.
         // This is the key fix for "8 hour late entry": 1H EMA recovers much faster than 4H.
@@ -265,14 +283,15 @@ pub fn evaluate(
         pass_macro_ema,
         pass_btc_macro,
         pass_rho,
+        pass_rsi_reversion,
     ]
     .iter()
     .filter(|&&x| x)
     .count();
     let setup_grade = match checklist_pass_count {
-        10 => "A",
-        9  => "B",
-        8  => "C",
+        11 => "A",
+        10 => "B",
+        9  => "C",
         _  => "D",
     };
 
@@ -341,10 +360,16 @@ pub fn evaluate(
             best.ams_regime_rho,
             effective_tier,
         ),
+        format!(
+            "Tier R RSI oversold gate (rsi14<50 for Tier R): {} (rsi14={:.1}, tier={})",
+            mark(pass_rsi_reversion),
+            best.rsi14,
+            effective_tier,
+        ),
     ];
 
     let quality_gate = format!(
-        "gate(grade={},regime={},score={},volume={},adx={},confidence={},prob={},macro_ema={},btc_macro={},rho={});bayes(prior={:.2},tech={:.2},news={:.2},post={:.2});ams={},ams_regime={:.2},ams_div={:.3},sel={}",
+        "gate(grade={},regime={},score={},volume={},adx={},confidence={},prob={},macro_ema={},btc_macro={},rho={},rsi_rev={});bayes(prior={:.2},tech={:.2},news={:.2},post={:.2});ams={},ams_regime={:.2},ams_div={:.3},sel={}",
         setup_grade,
         pass_regime,
         pass_score,
@@ -355,6 +380,7 @@ pub fn evaluate(
         pass_macro_ema,
         pass_btc_macro,
         pass_rho,
+        pass_rsi_reversion,
         prob.prior_up,
         prob.tech_likelihood,
         prob.news_likelihood,
@@ -365,7 +391,7 @@ pub fn evaluate(
         if ams_selected { "ams" } else { "bayes" },
     );
 
-    // All 10 gates must pass — no bypass.
+    // All 11 gates must pass — no bypass.
     let full_gate_pass = pass_regime
         && pass_score
         && pass_volume
@@ -375,7 +401,8 @@ pub fn evaluate(
         && hmtf_gate_ok
         && pass_macro_ema
         && pass_btc_macro
-        && pass_rho;
+        && pass_rho
+        && pass_rsi_reversion;
 
     if !full_gate_pass {
         // Waterfall: try next candidate before giving up.
