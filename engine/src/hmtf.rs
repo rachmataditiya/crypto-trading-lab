@@ -364,8 +364,13 @@ pub fn compute_hmtf(input: &HmtfInput) -> HmtfSignal {
     // Standard: vol > 4x + tf_1h > 0.05 + align >= 2 + adx > 28 + rsi < 78.
     // High-vol override: vol > 5x only needs align >= 1 — fast oversold bounces
     // recover 1H first while 4H/6H/12H lag. Missing these is the ETH-2026-03-01 bug.
+    // ADX_1H threshold: standard 28 for normal conditions.
+    // When volume is extreme (> 5x), lower to 22 — volume is a faster/stronger
+    // confirmation than ADX (which lags 14 candles). SOL 2026-03-04 case:
+    // vol=7.1x, adx_1h likely ~24, RSI=69 — should be Tier V but wasn't.
+    let adx_1h_threshold = if input.volume_ratio > 5.0 { 22.0 } else { 28.0 };
     let v_breakout = tf_1h.score > 0.05
-        && adx_1h > 28.0
+        && adx_1h > adx_1h_threshold
         && rsi_1h < 78.0
         && (
             (input.volume_ratio > 4.0 && alignment >= 2)

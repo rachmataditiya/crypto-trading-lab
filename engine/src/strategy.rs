@@ -209,17 +209,29 @@ pub fn evaluate(
     // Require BTC EMA20 > EMA50 (4H bull stack) AND ADX > 25 (clearly trending).
     // Exception: Tier R/V/F — enters on dips/bounces, BTC ADX will be low at entry.
     //   Only require BTC EMA alignment (not ADX) for reversion/breakout tiers.
+    // BTC "rally mode": BTC is clearly moving up today even if ADX hasn't caught up.
+    // ADX is a 14-candle lagging indicator — by the time ADX=25, the rally is 80% done.
+    // Direct momentum (ret_24h > 1.5%) is a faster, more responsive signal.
+    // Example: BTC +3.2% today, ADX=24.2 → old: BLOCKED. New: PASS (rally mode).
+    let btc_rally_mode = snapshot.coins.iter()
+        .find(|c| c.symbol == "BTCUSDT")
+        .map(|b| b.ret_24h > 1.5)
+        .unwrap_or(false);
+
     let pass_btc_macro = {
         let btc = snapshot.coins.iter().find(|c| c.symbol == "BTCUSDT");
         match btc {
-            None => true, // BTC not in snapshot — don't block
+            None => true,
             Some(b) => {
                 let btc_ema_ok = b.ema20 > b.ema50;
                 let btc_adx_ok = b.adx14 >= 25.0;
+                // Rally mode: if BTC is clearly up today, treat as trending
+                // even if ADX hasn't caught up yet (lagging indicator)
+                let btc_trending = btc_adx_ok || btc_rally_mode;
                 if is_reversion_tier || is_fast_tier {
-                    btc_ema_ok // Tier R/V/F: EMA only
+                    btc_ema_ok // Tier R/V/F: EMA only (enters on dips)
                 } else {
-                    btc_ema_ok && btc_adx_ok // Tier A/B: full trending filter
+                    btc_ema_ok && btc_trending // Tier A/B: EMA + (ADX or rally)
                 }
             }
         }
@@ -234,7 +246,15 @@ pub fn evaluate(
         match effective_tier {
             'A' | 'B' => rho > 0.55,  // clearly trending
             'R'       => rho < 0.45,  // clearly ranging (reversion)
-            'V' | 'F' => rho > 0.50,  // some momentum present
+            // Tier V/F in rally mode: relax rho floor from 0.50 → 0.35
+            // During macro BTC rally, individual coins follow BTC even if their
+            // own rho is low (they haven't updated their regime score yet).
+            // Volume > 5x is a stronger real-time confirmation than rho.
+            'V' | 'F' => if btc_rally_mode && best.volume_ratio > 5.0 {
+                rho > 0.35
+            } else {
+                rho > 0.50
+            },
             _         => true,
         }
     };
