@@ -209,13 +209,18 @@ pub fn evaluate(
     // Require BTC EMA20 > EMA50 (4H bull stack) AND ADX > 25 (clearly trending).
     // Exception: Tier R/V/F — enters on dips/bounces, BTC ADX will be low at entry.
     //   Only require BTC EMA alignment (not ADX) for reversion/breakout tiers.
-    // BTC "rally mode": BTC is clearly moving up today even if ADX hasn't caught up.
+    // BTC "rally mode": BTC is clearly in an uptrend even if ADX hasn't caught up.
     // ADX is a 14-candle lagging indicator — by the time ADX=25, the rally is 80% done.
-    // Direct momentum (ret_24h > 1.5%) is a faster, more responsive signal.
-    // Example: BTC +3.2% today, ADX=24.2 → old: BLOCKED. New: PASS (rally mode).
+    //
+    // Use TWO momentum windows to detect rally at any stage:
+    // - ret_24h > 1.5%: early/fresh rally (day 1)
+    // - ret_3d  > 3.0%: sustained rally (day 2-3, where 24h normalizes but trend continues)
+    //
+    // Example 2026-03-04: BTC +3.2% 24h → rally_mode=true ✅
+    // Example 2026-03-05: BTC +0.8% 24h (normalized) but ret_3d=+5% → rally_mode=true ✅
     let btc_rally_mode = snapshot.coins.iter()
         .find(|c| c.symbol == "BTCUSDT")
-        .map(|b| b.ret_24h > 1.5)
+        .map(|b| b.ret_24h > 1.5 || b.ret_3d > 3.0)
         .unwrap_or(false);
 
     let pass_btc_macro = {
