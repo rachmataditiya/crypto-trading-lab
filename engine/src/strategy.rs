@@ -164,8 +164,18 @@ pub fn evaluate(
     let pass_regime = regime != Regime::RiskOff; // block crash in both modes
 
     let pass_score = if speculative_avax_mode {
-        // Aggressive: EMA alignment (price > EMA20 > EMA50) = trend confirmed
-        best.price > best.ema20 && best.ema20 > best.ema50
+        if effective_tier == 'R' {
+            // Reversion mode: price BELOW EMA20 is the whole point (oversold bounce).
+            // Applying momentum gate (price > EMA20) here is fundamentally wrong —
+            // it blocks every legitimate Tier R entry.
+            // Instead: require AMS divergence signal exists OR RSI is extreme oversold.
+            // D > 0.05 = rubber-band stretched enough for reversion.
+            // RSI < 35 = direct oversold confirmation.
+            best.ams_divergence_d > 0.05 || best.rsi14 < 35.0
+        } else {
+            // Momentum/trend mode: EMA alignment (price > EMA20 > EMA50) = trend confirmed
+            best.price > best.ema20 && best.ema20 > best.ema50
+        }
     } else {
         best.score >= min_score
     };
@@ -184,8 +194,19 @@ pub fn evaluate(
         confidence_label != "weak"
     };
     let pass_probability = if speculative_avax_mode {
-        // Aggressive: require meaningful expected value (>= 0.5R), not just positive
-        prob.expected_value_r >= 0.5
+        if effective_tier == 'R' && best.rsi14 < 30.0 {
+            // Extreme oversold (RSI < 30) for Tier R: Bayesian model undervalues
+            // oversold bounces because it sees downtrend → low p_up.
+            // Historically RSI < 30 bounces have 60-70% win rate (mean reversion math).
+            // Relax: just require positive EV — the RSI extreme IS the edge.
+            prob.expected_value_r > 0.0
+        } else if effective_tier == 'R' {
+            // Normal Tier R: require at least 0.2R EV (lower bar than trend)
+            prob.expected_value_r >= 0.2
+        } else {
+            // Momentum tiers: require meaningful expected value (>= 0.5R)
+            prob.expected_value_r >= 0.5
+        }
     } else {
         prob.confidence >= 0.55 && prob.expected_value_r > 0.0
     };
@@ -290,8 +311,17 @@ pub fn evaluate(
         let e50 = if best.ema50_1h > 0.0 { best.ema50_1h } else { best.ema50 };
         best.price > e20 && e20 > e50
     } else if is_reversion_tier {
-        // Relaxed: just price above EMA20 (bouncing above short-term average)
-        best.price > best.ema20
+        // Reversion (Tier R/V): price is EXPECTED to be below EMA20 — that's the whole signal.
+        // Old check (price > EMA20) was backwards: blocked every legitimate oversold entry.
+        //
+        // New check: EMA20 must not be in free-fall relative to EMA50.
+        // If EMA20 < EMA50 * 0.92 (>8% below), the coin is in a structural bear market
+        // — not a bounce candidate but a falling knife. Otherwise: allow entry.
+        // This protects against catastrophic downtrends while allowing normal oversold bounces.
+        //
+        // Example passing: EMA20=$0.091, EMA50=$0.093 → ratio=0.978 > 0.92 → ✅ entry allowed
+        // Example blocked: EMA20=$0.070, EMA50=$0.093 → ratio=0.753 < 0.92 → ❌ free-fall
+        best.ema20 >= best.ema50 * 0.92
     } else {
         // Strict: full bull stack required for Tier A/B trend-following
         best.price > best.ema20 && best.ema20 > best.ema50
@@ -324,12 +354,15 @@ pub fn evaluate(
     let checklist = vec![
         format!("Regime not risk-off: {}", mark(pass_regime)),
         format!(
-            "Score gate (momentum mode: close>EMA20 & EMA20>EMA50): {} (score={}, close={:.6}, ema20={:.6}, ema50={:.6})",
+            "Score gate ({} mode): {} (score={}, close={:.6}, ema20={:.6}, ema50={:.6}, div={:.3}, rsi={:.1})",
+            if effective_tier == 'R' { "reversion: div>0.05 || rsi<35" } else { "momentum: close>EMA20>EMA50" },
             mark(pass_score),
             best.score,
             best.price,
             best.ema20,
-            best.ema50
+            best.ema50,
+            best.ams_divergence_d,
+            best.rsi14,
         ),
         format!(
             "Volume >= {:.1}x [{}]: {} (vol={:.2}x, tier={})",
@@ -369,11 +402,13 @@ pub fn evaluate(
             best.ams_divergence_d,
         ),
         format!(
-            "Macro EMA aligned (price>EMA20>EMA50): {} (price={:.4}, ema20={:.4}, ema50={:.4})",
+            "Macro EMA aligned ({} check): {} (price={:.4}, ema20={:.4}, ema50={:.4}, ratio={:.3})",
+            if is_reversion_tier { "reversion: ema20>=ema50*0.92" } else if is_fast_tier { "1H EMA stack" } else { "price>EMA20>EMA50" },
             mark(pass_macro_ema),
             best.price,
             best.ema20,
             best.ema50,
+            if best.ema50 > 0.0 { best.ema20 / best.ema50 } else { 1.0 },
         ),
         format!(
             "BTC macro filter (ema20>ema50 + adx>=25 for A/B): {}",
@@ -445,17 +480,36 @@ pub fn evaluate(
                 let e50 = if next.ema50_1h > 0.0 { next.ema50_1h } else { next.ema50 };
                 next.price > e20 && e20 > e50
             } else if n_is_rev {
-                next.price > next.ema20
+                // Reversion: EMA20 must not be in free-fall (>8% below EMA50)
+                next.ema20 >= next.ema50 * 0.92
             } else {
                 next.price > next.ema20 && next.ema20 > next.ema50
             };
+            let n_pass_score = if speculative_avax_mode && n_tier == 'R' {
+                next.ams_divergence_d > 0.05 || next.rsi14 < 35.0
+            } else if speculative_avax_mode {
+                next.price > next.ema20 && next.ema20 > next.ema50
+            } else {
+                next.score >= min_score
+            };
+            let n_pass_prob = if speculative_avax_mode {
+                if n_tier == 'R' && next.rsi14 < 30.0 {
+                    n_prob.expected_value_r > 0.0
+                } else if n_tier == 'R' {
+                    n_prob.expected_value_r >= 0.2
+                } else {
+                    n_prob.expected_value_r >= 0.5
+                }
+            } else {
+                n_prob.confidence >= 0.55 && n_prob.expected_value_r > 0.0
+            };
             let n_vol_min = volume_gate_threshold(&config.preset, &regime);
             let n_pass = pass_regime
-                && next.score >= min_score
+                && n_pass_score
                 && next.volume_ratio >= n_vol_min
                 && next.adx14 >= min_adx
                 && n_conf != "weak"
-                && n_prob.confidence >= 0.55 && n_prob.expected_value_r > 0.0
+                && n_pass_prob
                 && n_gate_ok
                 && n_pass_ema;
             if n_pass {
