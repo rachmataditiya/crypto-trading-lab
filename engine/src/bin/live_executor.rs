@@ -409,8 +409,11 @@ fn macro_ema_aligned(symbol: &str, cache_path: &Path, is_reversion_tier: bool, i
         if e20 <= 0.0 || e50 <= 0.0 { return true; }
         price > e20 && e20 > e50
     } else if is_reversion_tier {
-        if ema20 <= 0.0 { return true; }
-        price > ema20
+        // Reversion: price is EXPECTED below EMA20 (oversold bounce).
+        // Old check (price > EMA20) was backwards — blocked every oversold entry.
+        // New: EMA20 must not be in free-fall (>8% below EMA50 = structural bear).
+        if ema20 <= 0.0 || ema50 <= 0.0 { return true; }
+        ema20 >= ema50 * 0.92
     } else {
         if ema20 <= 0.0 || ema50 <= 0.0 { return true; }
         price > ema20 && ema20 > ema50
@@ -930,10 +933,27 @@ fn main() -> Result<()> {
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_SHORT",0.0,"");
                     continue;
                 }
-                if !should_trade(&sig, &ecfg) {
-                    println!("[executor] ⏩ Tier C skip: EV={:.2} Conf={:.2}", ev.unwrap_or(0.0), conf.unwrap_or(0.0));
+                // Extract tier from quality_gate BEFORE should_trade check
+                // so Tier R (reversion) can use relaxed EV threshold.
+                let pre_tier_char = quality_gate.as_deref().unwrap_or("")
+                    .split(';').find(|s| s.starts_with("ams="))
+                    .and_then(|s| s.strip_prefix("ams="))
+                    .and_then(|s| s.chars().next())
+                    .unwrap_or('C');
+                let ev_val   = ev.unwrap_or(0.0);
+                let conf_val = conf.unwrap_or(0.0);
+                // Tier R/V (reversion): relax EV threshold — Bayesian model undervalues
+                // oversold bounces (RSI 18-25). Strategy.rs already gates this with
+                // rsi<30 → ev>0 / else ev>=0.2. Match that logic here.
+                let passes_ev_gate = if pre_tier_char == 'R' || pre_tier_char == 'V' {
+                    ev_val > 0.0  // any positive EV — quality gate in sim already screened
+                } else {
+                    ev_val >= ecfg.kelly.tier_c.max_ev && conf_val >= ecfg.kelly.tier_c.max_conf
+                };
+                if !passes_ev_gate {
+                    println!("[executor] ⏩ Tier C skip: EV={:.2} Conf={:.2}", ev_val, conf_val);
                     mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_TIER_C",0.0,
-                        &format!("ev={:.2} conf={:.2}", ev.unwrap_or(0.0), conf.unwrap_or(0.0)));
+                        &format!("ev={:.2} conf={:.2}", ev_val, conf_val));
                     continue;
                 }
                 if count_open_positions(&live_conn) >= ecfg.max_open_positions {
@@ -2557,37 +2577,52 @@ mod tests {
 
     #[test]
     fn macro_ema_aligned_price_below_ema20_blocked() {
-        // price=82 < ema20=87 → block even in reversion mode
+        // Trend mode: price=82 < ema20=87 < ema50=92 → bear stack → blocked
+        // Reversion mode (Tier R): price below EMA20 is EXPECTED for oversold bounce.
+        //   New check: ema20(87) >= ema50(92)*0.92=84.6 → 87>=84.6 → ALLOWED ✅
+        //   (EMA20 is only slightly below EMA50 — normal oversold, not free-fall)
         let dir = tempfile::tempdir().unwrap();
         write_cache_with_emas(&dir, "SOLUSDT", 82.0, 87.0, 92.0);
         assert!(!macro_ema_aligned("SOLUSDT", dir.path(), false, false),
-            "Bear stack (price<EMA20<EMA50) must be blocked — 2026-02-27 SOL pattern");
+            "Bear stack (price<EMA20<EMA50) must be blocked in trend mode");
+        assert!(macro_ema_aligned("SOLUSDT", dir.path(), true, false),
+            "Tier R: ema20(87)>=ema50(92)*0.92 → allowed (normal oversold, not free-fall)");
+    }
+
+    #[test]
+    fn macro_ema_aligned_reversion_free_fall_blocked() {
+        // Tier R free-fall: ema20 is >8% below ema50 → structural bear → block
+        // ema20=80, ema50=92 → ratio=0.869 < 0.92 → BLOCKED
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_with_emas(&dir, "SOLUSDT", 75.0, 80.0, 92.0);
+        assert!(!macro_ema_aligned("SOLUSDT", dir.path(), false, false),
+            "Trend mode must block free-fall");
         assert!(!macro_ema_aligned("SOLUSDT", dir.path(), true, false),
-            "Price below EMA20 must be blocked even in reversion mode (no bounce yet)");
+            "Tier R must block when ema20 is >8% below ema50 (structural bear/free-fall)");
     }
 
     #[test]
     fn macro_ema_aligned_ema20_below_ema50_blocked_for_trend() {
         // price=90 > ema20=88 but ema20<ema50=92 → death cross
-        // Trend mode: blocked. Reversion mode: allowed (price > EMA20 is enough).
+        // Trend mode: blocked. Reversion mode: ema20(88)>=ema50(92)*0.92=84.6 → allowed.
         let dir = tempfile::tempdir().unwrap();
         write_cache_with_emas(&dir, "SOLUSDT", 90.0, 88.0, 92.0);
         assert!(!macro_ema_aligned("SOLUSDT", dir.path(), false, false),
             "Death cross (EMA20<EMA50) must be blocked in trend mode");
         assert!(macro_ema_aligned("SOLUSDT", dir.path(), true, false),
-            "Tier R/V: price>EMA20 is sufficient even if EMA20<EMA50 (oversold bounce)");
+            "Tier R/V: ema20(88)>=ema50(92)*0.92 — normal dip, not free-fall → allowed");
     }
 
     #[test]
     fn macro_ema_aligned_tier_r_eth_march01_pattern() {
-        // ETH 2026-03-01: price=1977 > ema20=1947 but ema20(1947) < ema50(1953)
-        // Old code: blocked. New code Tier R: allowed.
+        // ETH 2026-03-01: price=1977, ema20=1947, ema50=1953
+        // ema20(1947)/ema50(1953) = 0.997 > 0.92 → NOT free-fall → Tier R allowed
         let dir = tempfile::tempdir().unwrap();
         write_cache_with_emas(&dir, "ETHUSDT", 1977.0, 1947.0, 1953.0);
         assert!(!macro_ema_aligned("ETHUSDT", dir.path(), false, false),
             "Trend mode must block ETH death cross");
         assert!(macro_ema_aligned("ETHUSDT", dir.path(), true, false),
-            "Tier R must allow ETH bounce — this is the 2026-03-01 missed trade");
+            "Tier R must allow ETH — ema20/ema50=0.997 > 0.92, oversold bounce valid");
     }
 
     #[test]
