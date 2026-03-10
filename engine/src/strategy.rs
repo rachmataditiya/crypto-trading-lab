@@ -22,6 +22,23 @@ pub fn volume_gate_threshold(preset: &str, regime: &Regime) -> f64 {
         Regime::RiskOn => base,
     }
 }
+
+/// Volume threshold specifically for Tier R during deep oversold recovery.
+///
+/// During recovery from extreme oversold (BTC RSI was < 25), volume is
+/// structurally lower — institutions accumulate quietly, not aggressively.
+/// Applying the standard 2.2x threshold blocks every early recovery entry.
+///
+/// Logic: if BTC RSI < 35 (still recovering from deep dump), relax to 1.5x.
+/// This captures the "quiet accumulation" phase before volume explodes.
+/// The ρ < 0.45 and rsi < 50 gates for Tier R already filter noise.
+pub fn volume_gate_tier_r(btc_rsi: f64) -> f64 {
+    if btc_rsi < 35.0 {
+        1.5 // deep oversold recovery — accumulation phase, lower volume normal
+    } else {
+        2.0 // normal threshold
+    }
+}
 use crate::risk;
 
 pub fn evaluate(
@@ -168,10 +185,15 @@ pub fn evaluate(
             // Reversion mode: price BELOW EMA20 is the whole point (oversold bounce).
             // Applying momentum gate (price > EMA20) here is fundamentally wrong —
             // it blocks every legitimate Tier R entry.
-            // Instead: require AMS divergence signal exists OR RSI is extreme oversold.
-            // D > 0.05 = rubber-band stretched enough for reversion.
-            // RSI < 35 = direct oversold confirmation.
-            best.ams_divergence_d > 0.05 || best.rsi14 < 35.0
+            //
+            // Score is also unreliable during early recovery:
+            // - Score is based on momentum indicators that lag price
+            // - At RSI 20-35, score is naturally LOW even when bounce is imminent
+            // - AMS divergence D and RSI oversold are better reversion signals
+            //
+            // Gate: AMS divergence > 0.05 (rubber-band stretched) OR RSI < 40.
+            // RSI < 40 = still in oversold/recovery zone, bounce is statistically likely.
+            best.ams_divergence_d > 0.05 || best.rsi14 < 40.0
         } else {
             // Momentum/trend mode: EMA alignment (price > EMA20 > EMA50) = trend confirmed
             best.price > best.ema20 && best.ema20 > best.ema50
@@ -179,7 +201,19 @@ pub fn evaluate(
     } else {
         best.score >= min_score
     };
-    let pass_volume = best.volume_ratio >= min_volume; // same gate both modes, research-backed
+    // Volume gate: Tier R during deep oversold recovery gets relaxed threshold.
+    // Standard 2.2x blocks every early-recovery entry (institutions accumulate quietly).
+    // BTC RSI < 35 = still recovering from deep dump → use 1.5x instead.
+    let btc_rsi_now = snapshot.coins.iter()
+        .find(|c| c.symbol == "BTCUSDT")
+        .map(|b| b.rsi14)
+        .unwrap_or(50.0);
+    let effective_vol_min = if effective_tier == 'R' {
+        volume_gate_tier_r(btc_rsi_now)
+    } else {
+        min_volume
+    };
+    let pass_volume = best.volume_ratio >= effective_vol_min;
 
     let pass_adx = if speculative_avax_mode {
         // Aggressive: ADX >= 20 — Wilder (1978) standard "trending market" threshold
@@ -254,8 +288,20 @@ pub fn evaluate(
                 // Rally mode: if BTC is clearly up today, treat as trending
                 // even if ADX hasn't caught up yet (lagging indicator)
                 let btc_trending = btc_adx_ok || btc_rally_mode;
-                if is_reversion_tier || is_fast_tier {
-                    btc_ema_ok // Tier R/V/F: EMA only (enters on dips)
+                // Deep oversold recovery mode for Tier R:
+                // When BTC RSI < 35 AND is rising (ret_24h > 0), BTC is in early
+                // recovery phase. EMA20 < EMA50 is expected (EMAs lag price by 20-50
+                // candles). Requiring EMA cross at this stage = always entering LATE
+                // (after +10-15% from bottom). The ρ < 0.45 + rsi < 50 gates for
+                // Tier R already prevent entering during macro crashes.
+                //
+                // Example missed: SOL 2026-03-08 01:07 — Tier R grade B, BTC RSI=25,
+                // EMA20<EMA50 → blocked. SOL went from $78 → $86 (+10%) that day.
+                let btc_deep_recovery = b.rsi14 < 35.0 && b.ret_24h > 0.0;
+                if effective_tier == 'R' && btc_deep_recovery {
+                    true // Deep recovery: skip EMA requirement, rsi/rho gates protect
+                } else if is_reversion_tier || is_fast_tier {
+                    btc_ema_ok // Tier R/V/F normal: EMA only (enters on dips)
                 } else {
                     btc_ema_ok && btc_trending // Tier A/B: EMA + (ADX or rally)
                 }
@@ -365,12 +411,14 @@ pub fn evaluate(
             best.rsi14,
         ),
         format!(
-            "Volume >= {:.1}x [{}]: {} (vol={:.2}x, tier={})",
-            min_volume,
-            if speculative_avax_mode { "aggressive" } else { "normal" },
+            "Volume >= {:.1}x [{}]: {} (vol={:.2}x, tier={}, btc_rsi={:.0})",
+            effective_vol_min,
+            if effective_tier == 'R' && btc_rsi_now < 35.0 { "recovery-relaxed" }
+            else if speculative_avax_mode { "aggressive" } else { "normal" },
             mark(pass_volume),
             best.volume_ratio,
-            vol_tier
+            vol_tier,
+            btc_rsi_now,
         ),
         format!(
             "ADX >= {:.1}: {} (adx={:.1})",
@@ -411,8 +459,10 @@ pub fn evaluate(
             if best.ema50 > 0.0 { best.ema20 / best.ema50 } else { 1.0 },
         ),
         format!(
-            "BTC macro filter (ema20>ema50 + adx>=25 for A/B): {}",
+            "BTC macro filter (ema20>ema50 + adx>=25 for A/B): {} (btc_rsi={:.0}, deep_rec={})",
             mark(pass_btc_macro),
+            btc_rsi_now,
+            btc_rsi_now < 35.0 && snapshot.coins.iter().find(|c| c.symbol == "BTCUSDT").map(|b| b.ret_24h > 0.0).unwrap_or(false),
         ),
         format!(
             "Regime ρ floor (A/B>0.55, R<0.45, V/F>0.50): {} (ρ={:.2}, tier={})",
@@ -486,7 +536,7 @@ pub fn evaluate(
                 next.price > next.ema20 && next.ema20 > next.ema50
             };
             let n_pass_score = if speculative_avax_mode && n_tier == 'R' {
-                next.ams_divergence_d > 0.05 || next.rsi14 < 35.0
+                next.ams_divergence_d > 0.05 || next.rsi14 < 40.0
             } else if speculative_avax_mode {
                 next.price > next.ema20 && next.ema20 > next.ema50
             } else {
@@ -503,7 +553,23 @@ pub fn evaluate(
             } else {
                 n_prob.confidence >= 0.55 && n_prob.expected_value_r > 0.0
             };
-            let n_vol_min = volume_gate_threshold(&config.preset, &regime);
+            let n_vol_min = if n_tier == 'R' {
+                volume_gate_tier_r(btc_rsi_now)
+            } else {
+                volume_gate_threshold(&config.preset, &regime)
+            };
+            let n_btc_deep_rec = snapshot.coins.iter().find(|c| c.symbol == "BTCUSDT")
+                .map(|b| b.rsi14 < 35.0 && b.ret_24h > 0.0).unwrap_or(false);
+            let n_pass_btc = if n_tier == 'R' && n_btc_deep_rec {
+                true
+            } else if n_is_rev || n_is_fast {
+                snapshot.coins.iter().find(|c| c.symbol == "BTCUSDT")
+                    .map(|b| b.ema20 > b.ema50).unwrap_or(true)
+            } else {
+                snapshot.coins.iter().find(|c| c.symbol == "BTCUSDT")
+                    .map(|b| b.ema20 > b.ema50 && (b.adx14 >= 25.0 || btc_rally_mode))
+                    .unwrap_or(true)
+            };
             let n_pass = pass_regime
                 && n_pass_score
                 && next.volume_ratio >= n_vol_min
@@ -511,7 +577,8 @@ pub fn evaluate(
                 && n_conf != "weak"
                 && n_pass_prob
                 && n_gate_ok
-                && n_pass_ema;
+                && n_pass_ema
+                && n_pass_btc;
             if n_pass {
                 // Recurse with a snapshot containing only this candidate as top coin.
                 // Simpler: rebuild a mini snapshot and re-evaluate.
@@ -1208,5 +1275,45 @@ mod tests {
              quality_gate='{}'",
             result.quality_gate
         );
+    }
+
+    // --- volume_gate_tier_r tests ---
+
+    #[test]
+    fn test_vgt_tier_r_deep_recovery() {
+        // BTC RSI < 35 → relaxed to 1.5x
+        assert_eq!(volume_gate_tier_r(20.0), 1.5, "RSI 20 = deep recovery = 1.5x");
+        assert_eq!(volume_gate_tier_r(34.9), 1.5, "RSI 34.9 = still recovery = 1.5x");
+    }
+
+    #[test]
+    fn test_vgt_tier_r_normal() {
+        // BTC RSI >= 35 → normal 2.0x
+        assert_eq!(volume_gate_tier_r(35.0), 2.0, "RSI 35 = normal threshold = 2.0x");
+        assert_eq!(volume_gate_tier_r(60.0), 2.0, "RSI 60 = normal = 2.0x");
+    }
+
+    #[test]
+    fn test_vgt_tier_r_boundary() {
+        // Exactly at boundary: RSI 35.0 → normal threshold (2.0x)
+        assert_eq!(volume_gate_tier_r(35.0), 2.0);
+        // Just below: RSI 34.9 → relaxed (1.5x)
+        assert_eq!(volume_gate_tier_r(34.9), 1.5);
+    }
+
+    #[test]
+    fn test_vgt_tier_r_extreme_oversold() {
+        // RSI 10 (extreme crash bottom) → most relaxed = 1.5x
+        assert_eq!(volume_gate_tier_r(10.0), 1.5);
+        // RSI 0 → still 1.5x
+        assert_eq!(volume_gate_tier_r(0.0), 1.5);
+    }
+
+    #[test]
+    fn test_vgt_tier_r_overbought() {
+        // RSI 70 → normal 2.0x (no relaxation in overbought)
+        assert_eq!(volume_gate_tier_r(70.0), 2.0);
+        // RSI 80 → 2.0x
+        assert_eq!(volume_gate_tier_r(80.0), 2.0);
     }
 }
