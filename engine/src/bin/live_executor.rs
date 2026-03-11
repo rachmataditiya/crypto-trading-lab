@@ -547,14 +547,38 @@ fn place_market_buy(client: &Client, cfg: &Config, inst: &str, usdt_amount: f64)
     } else { Err(anyhow!("Buy failed: {}", r)) }
 }
 
-fn place_sl(client: &Client, cfg: &Config, inst: &str, qty: f64, sl_px: f64) {
+/// Place a single OCO algo order (SL + TP in one order) after buy fill.
+/// This replaces the old approach of placing SL conditional order separately.
+/// OCO does NOT lock the coin balance twice — OKX manages both legs internally.
+/// When either SL or TP triggers, the other leg is automatically cancelled.
+fn place_oco(client: &Client, cfg: &Config, inst: &str, qty: f64, sl_px: f64, tp_px: f64) {
     let qty_floor = (qty * 10000.0).floor() / 10000.0;
-    let body = json!({"instId":inst,"tdMode":"cash","side":"sell","ordType":"conditional",
-                      "sz":format!("{:.4}",qty_floor),"slTriggerPx":format!("{:.4}",sl_px),"slOrdPx":"-1"});
+    let body = json!({
+        "instId": inst,
+        "tdMode": "cash",
+        "side": "sell",
+        "ordType": "oco",
+        "sz": format!("{:.4}", qty_floor),
+        "tpTriggerPx": format!("{:.4}", tp_px),
+        "tpOrdPx": "-1",
+        "slTriggerPx": format!("{:.4}", sl_px),
+        "slOrdPx": "-1"
+    });
     match okx_post(client, cfg, "/api/v5/trade/order-algo", &body) {
-        Ok(r) if r["code"].as_str() == Some("0") => println!("[executor] 🛡️  SL @ {:.4}", sl_px),
-        Ok(r) => println!("[executor] ⚠️  SL failed: {}", r["data"][0]["sMsg"]),
-        Err(e) => println!("[executor] ⚠️  SL error: {}", e),
+        Ok(r) if r["code"].as_str() == Some("0") =>
+            println!("[executor] 🛡️  OCO active | SL={:.4} TP={:.4} qty={:.4}", sl_px, tp_px, qty_floor),
+        Ok(r) => {
+            // OCO not supported (e.g. account type restriction) — fallback to SL-only conditional
+            println!("[executor] ⚠️  OCO failed: {} — falling back to SL-only", r["data"][0]["sMsg"]);
+            let sl_body = json!({"instId":inst,"tdMode":"cash","side":"sell","ordType":"conditional",
+                                 "sz":format!("{:.4}",qty_floor),"slTriggerPx":format!("{:.4}",sl_px),"slOrdPx":"-1"});
+            match okx_post(client, cfg, "/api/v5/trade/order-algo", &sl_body) {
+                Ok(r2) if r2["code"].as_str() == Some("0") => println!("[executor] 🛡️  SL fallback @ {:.4}", sl_px),
+                Ok(r2) => println!("[executor] ⚠️  SL fallback also failed: {}", r2["data"][0]["sMsg"]),
+                Err(e) => println!("[executor] ⚠️  SL fallback error: {}", e),
+            }
+        },
+        Err(e) => println!("[executor] ⚠️  OCO error: {}", e),
     }
 }
 
@@ -562,8 +586,14 @@ fn place_sl(client: &Client, cfg: &Config, inst: &str, qty: f64, sl_px: f64) {
 /// Must be called BEFORE any market sell (TP/trail/time/SL software) to free the
 /// coin balance that OKX locks when an algo order is active.
 fn cancel_pending_algos(client: &Client, cfg: &Config, inst: &str) {
+    // Cancel both ordType=conditional (legacy SL) and ordType=oco (attachAlgoOrds SL+TP)
+    cancel_pending_algos_type(client, cfg, inst, "conditional");
+    cancel_pending_algos_type(client, cfg, inst, "oco");
+}
+
+fn cancel_pending_algos_type(client: &Client, cfg: &Config, inst: &str, ord_type: &str) {
     // 1. Fetch all pending algo orders for this instrument
-    let url = format!("/api/v5/trade/orders-algo-pending?instId={}&ordType=conditional", inst);
+    let url = format!("/api/v5/trade/orders-algo-pending?instId={}&ordType={}", inst, ord_type);
     let pending = match okx_get(client, cfg, &url) {
         Ok(v) => v,
         Err(e) => { eprintln!("[executor] algo-pending fetch error: {}", e); return; }
@@ -1264,7 +1294,10 @@ fn main() -> Result<()> {
                             // with "insufficient balance" — conflicting orders on simple spot.
                             let entry_rsi = get_rsi_from_cache(&sig.symbol, &base);
                             let hold_min_tier = tier_aware_hold_min(&ecfg, &sig.symbol, ams_tier_char, entry_rsi);
-                            place_sl(&client, &cfg, &inst, actual_qty, actual_stop);
+                            // OCO algo order: SL + TP in one order — no balance lock conflict.
+                            // OKX manages both legs; when one triggers the other auto-cancels.
+                            // Software monitoring (RSI exit, trail, time) cancels this OCO before selling.
+                            place_oco(&client, &cfg, &inst, actual_qty, actual_stop, actual_tp1);
                             open_position(&live_conn, sig_id, &order_id, &sig.symbol,
                                           &sig.direction, actual_qty, fill, actual_stop, actual_tp1, risk_usdt,
                                           actual_tp2, p_up_val, ams_tier_char, entry_rsi);
@@ -1390,8 +1423,8 @@ fn main() -> Result<()> {
                         "UPDATE daily_stats SET realized_pnl=realized_pnl+? WHERE trade_date=?",
                         params![half_pnl, today_utc]).ok();
                     println!("[executor] ✅ Half sold. Remaining {:.4} {}, SL moved to breakeven {:.4}", remaining_qty, symbol, entry);
-                    // Re-place SL at breakeven for remaining position
-                    place_sl(&client, &cfg, &inst, remaining_qty, entry);
+                    // Re-place OCO: SL at breakeven + TP at TP2 for remaining position
+                    place_oco(&client, &cfg, &inst, remaining_qty, entry, tp2);
                 } else {
                     println!("[executor] ⚠️  Partial sell failed — retrying next cycle");
                 }
