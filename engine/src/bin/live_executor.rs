@@ -888,13 +888,22 @@ fn main() -> Result<()> {
         cfg.risk_per_trade_pct, ecfg.max_open_positions, ecfg.max_portfolio_risk_pct);
 
     loop {
-        // Use UTC date to match closed_at which is stored as Utc::now().to_rfc3339().
-        // Previously used Local (Jakarta), causing mismatch 00:00–07:00 WIB → re-entry guard broken.
-        let today  = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let cutoff = (Local::now() - Duration::minutes(ecfg.max_signal_age_min)).format("%H:%M").to_string();
+        // TWO separate date strings — each must match the storage format of its target table:
+        //
+        // 1. `today_utc` — for live_positions.db tables (daily_stats, open_positions, processed_signals).
+        //    closed_at / opened_at stored as Utc::now().to_rfc3339() → date in UTC.
+        //    Previously used Local (Jakarta), causing mismatch 00:00–07:00 WIB → re-entry guard broken.
+        //
+        // 2. `today_local` — for sim_history.db (simulation_events.trade_date).
+        //    Sim stores trade_date/trade_time as Local (WIB) from inserted_at timestamp.
+        //    Using UTC here = mismatch 00:00–07:00 WIB → executor never finds today's PAPER_TRADE signals.
+        //    Root cause of SOL grade A being ignored 2026-03-11 01:25–01:50 WIB.
+        let today_utc   = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today_local = Local::now().format("%Y-%m-%d").to_string();
+        let cutoff      = (Local::now() - Duration::minutes(ecfg.max_signal_age_min)).format("%H:%M").to_string();
 
         let equity = get_equity(&client, &cfg).unwrap_or(116.0);
-        let (realized_pnl, consec_losses, trade_count, cb_hit) = get_daily_stats(&live_conn, &today, equity);
+        let (realized_pnl, consec_losses, trade_count, cb_hit) = get_daily_stats(&live_conn, &today_utc, equity);
 
         let drawdown = if equity > 0.0 { -realized_pnl / equity } else { 0.0 };
         let risk_ok  = is_risk_ok(cb_hit, consec_losses, drawdown, cb_losses, max_dd);
@@ -911,7 +920,7 @@ fn main() -> Result<()> {
                  ORDER BY expected_value_r DESC"  // best EV first
             )?;
             let rows: Vec<(i64, String, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<String>)> =
-                stmt.query_map(params![today, cutoff], |r| {
+                stmt.query_map(params![today_local, cutoff], |r| {
                     Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))
                 })?.filter_map(|r| r.ok()).collect();
             drop(stmt); drop(sim_conn);
@@ -1116,7 +1125,7 @@ fn main() -> Result<()> {
                 // more trades (market condition confirmed good).
                 // No trade today yet (trade_count=0) → always allow first trade.
                 if trade_count >= 1 {
-                    let last_was_profit = last_trade_was_profit(&live_conn, &today);
+                    let last_was_profit = last_trade_was_profit(&live_conn, &today_utc);
                     if !last_was_profit {
                         println!("[executor] 🚫 Last trade today was not profitable — pause rest of day (trade_count={})", trade_count);
                         mark_processed(&live_conn,sig_id,&sig.symbol,&sig.direction,sig.entry,sig.stop,sig.tp1,"","SKIPPED_MAX_DAILY",0.0,
@@ -1208,7 +1217,7 @@ fn main() -> Result<()> {
                                           actual_tp2, p_up_val, ams_tier_char);
                             live_conn.execute(
                                 "UPDATE daily_stats SET trade_count=trade_count+1 WHERE trade_date=?",
-                                params![today]).ok();
+                                params![today_utc]).ok();
                             journal_opened(&base, &sig, fill, usdt_spend, equity, risk_frac, max_hold_min(&ecfg, &sig.symbol), &ecfg);
                             mark_processed(&live_conn, sig_id, &sig.symbol, &sig.direction,
                                            sig.entry, actual_stop, actual_tp1, &order_id, "FILLED", fill,
@@ -1291,7 +1300,7 @@ fn main() -> Result<()> {
                          trade_count=trade_count+1,
                          consecutive_losses=CASE WHEN ?2=1 THEN consecutive_losses+1 ELSE 0 END
                          WHERE trade_date=?3",
-                        params![ghost_pnl, is_loss, today]).ok();
+                        params![ghost_pnl, is_loss, today_utc]).ok();
                     continue;
                 }
             }
@@ -1326,7 +1335,7 @@ fn main() -> Result<()> {
                         params![remaining_qty, pid]).ok();
                     live_conn.execute(
                         "UPDATE daily_stats SET realized_pnl=realized_pnl+? WHERE trade_date=?",
-                        params![half_pnl, today]).ok();
+                        params![half_pnl, today_utc]).ok();
                     println!("[executor] ✅ Half sold. Remaining {:.4} {}, SL moved to breakeven {:.4}", remaining_qty, symbol, entry);
                     // Re-place SL at breakeven for remaining position
                     place_sl(&client, &cfg, &inst, remaining_qty, entry);
@@ -1398,7 +1407,7 @@ fn main() -> Result<()> {
                     "UPDATE daily_stats SET realized_pnl=realized_pnl+?,
                      consecutive_losses=CASE WHEN ?2=1 THEN consecutive_losses+1 ELSE 0 END
                      WHERE trade_date=?3",
-                    params![pnl,is_loss,today]).ok();
+                    params![pnl,is_loss,today_utc]).ok();
                 journal_closed(&base, &fake, pnl, status, &reason);
             }
         }
