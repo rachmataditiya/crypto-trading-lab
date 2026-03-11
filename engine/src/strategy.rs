@@ -501,20 +501,35 @@ pub fn evaluate(
         if ams_selected { "ams" } else { "bayes" },
     );
 
-    // All 11 gates must pass — no bypass.
-    let full_gate_pass = pass_regime
-        && pass_score
-        && pass_volume
-        && pass_adx
-        && pass_confidence
-        && pass_probability
-        && hmtf_gate_ok
-        && pass_macro_ema
-        && pass_btc_macro
-        && pass_rho
-        && pass_rsi_reversion;
+    // All 11 gates must pass for grade A.
+    // Grade B (10/11): allowed to execute with 0.7× Kelly penalty IF the failed gate
+    // is NOT a fundamental risk gate (regime, rho, rsi_rev).
+    //
+    // Mathematical basis: if each gate has ~92% accuracy for valid signals,
+    // P(all 11 pass | valid) = 0.92^11 = 40%. We miss 60% of valid grade B signals.
+    // Grade B reduces position size by 30% — risk-adjusted, not risk-eliminated.
+    //
+    // Hard veto gates (must always pass — failing = fundamental invalid signal):
+    //   pass_regime     — market in crash mode (RiskOff)
+    //   pass_rho        — regime mismatch for this tier
+    //   pass_rsi_reversion — entering Tier R at RSI 60 is wrong by definition
+    //   hmtf_gate_ok    — no tier classification at all
+    //
+    // Soft gates (1 miss allowed at 0.7× Kelly):
+    //   pass_score, pass_volume, pass_adx, pass_confidence,
+    //   pass_probability, pass_macro_ema, pass_btc_macro
+    let hard_gate_pass = pass_regime && pass_rho && pass_rsi_reversion && hmtf_gate_ok;
+    let soft_gates = [pass_score, pass_volume, pass_adx, pass_confidence,
+                      pass_probability, pass_macro_ema, pass_btc_macro];
+    let soft_pass_count = soft_gates.iter().filter(|&&x| x).count();
 
-    if !full_gate_pass {
+    let full_gate_pass = hard_gate_pass && soft_pass_count == soft_gates.len();
+    // Grade B: all hard gates pass + exactly 6 of 7 soft gates pass
+    let grade_b_pass = !full_gate_pass && hard_gate_pass && soft_pass_count >= 6;
+    // Kelly reduction factor for grade B signals
+    let grade_b_kelly_factor = if grade_b_pass { 0.7_f64 } else { 1.0_f64 };
+
+    if !full_gate_pass && !grade_b_pass {
         // Waterfall: try next candidate before giving up.
         // Skip index 0 (already tried as `best`), iterate rest in score order.
         for next in sorted_candidates.iter().skip(1) {
@@ -644,12 +659,13 @@ pub fn evaluate(
         risk::adjusted_risk_pct(config, regime, confidence_label)
     };
     // Apply AMS kelly multiplier for R/V trades (half Kelly)
+    // Additionally apply grade_b_kelly_factor (0.7×) for grade B signals
     let risk_pct = if is_fast_tier && best.ams_kelly_multiplier > 0.0 {
-        base_risk * best.ams_kelly_multiplier // 0.3x Kelly for Tier F (lowest confidence)
+        base_risk * best.ams_kelly_multiplier * grade_b_kelly_factor
     } else if matches!(effective_tier, 'R' | 'V') && best.ams_kelly_multiplier > 0.0 {
-        base_risk * best.ams_kelly_multiplier
+        base_risk * best.ams_kelly_multiplier * grade_b_kelly_factor
     } else {
-        base_risk
+        base_risk * grade_b_kelly_factor
     };
     let atr_value = best.price * (best.atr14_pct / 100.0);
     // Tier R/V: conservative EV (win_rate=0.45, reward=1.2R)
@@ -695,8 +711,9 @@ pub fn evaluate(
         regime: regime.to_string(),
         watchlist_top3,
         setup_idea: format!(
-            "{} {} continuation ({}) [grade {}]",
-            best.symbol, direction, confidence_label, setup_grade
+            "{} {} continuation ({}) [grade {}{}]",
+            best.symbol, direction, confidence_label, setup_grade,
+            if grade_b_pass { " 0.7×K" } else { "" }
         ),
         quality_gate: format!("{};expected_r={:.1}", quality_gate, expected_r),
         checklist,
