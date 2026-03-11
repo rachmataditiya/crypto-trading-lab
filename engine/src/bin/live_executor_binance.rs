@@ -17,7 +17,7 @@ use sha2::Sha256;
 use std::{collections::HashMap, fs, path::{Path, PathBuf}, thread, time::Duration as StdDuration};
 
 // ── Constants ────────────────────────────────────────────────────────────────
-const BINANCE_BASE: &str = "https://api.binance.com";
+const BINANCE_BASE: &str = "https://api.binance.com"; // verified working with Warp VPN
 use hex;
 
 // ── Executor Config (loaded from executor_config.json) ───────────────────────
@@ -209,9 +209,9 @@ fn bnb_sign(secret: &str, query: &str) -> String {
 fn bnb_get(client: &Client, cfg: &Config, path: &str, extra_params: &str) -> Result<Value> {
     let ts = Utc::now().timestamp_millis();
     let query = if extra_params.is_empty() {
-        format!("timestamp={}", ts)
+        format!("recvWindow=10000&timestamp={}", ts)
     } else {
-        format!("{}&timestamp={}", extra_params, ts)
+        format!("{}&recvWindow=10000&timestamp={}", extra_params, ts)
     };
     let sig = bnb_sign(&cfg.secret_key, &query);
     let url = format!("{}{}?{}&signature={}", BINANCE_BASE, path, query, sig);
@@ -224,9 +224,9 @@ fn bnb_get(client: &Client, cfg: &Config, path: &str, extra_params: &str) -> Res
 fn bnb_post(client: &Client, cfg: &Config, path: &str, params: &str) -> Result<Value> {
     let ts = Utc::now().timestamp_millis();
     let query = if params.is_empty() {
-        format!("timestamp={}", ts)
+        format!("recvWindow=10000&timestamp={}", ts)
     } else {
-        format!("{}&timestamp={}", params, ts)
+        format!("{}&recvWindow=10000&timestamp={}", params, ts)
     };
     let sig = bnb_sign(&cfg.secret_key, &query);
     let body = format!("{}&signature={}", query, sig);
@@ -1018,8 +1018,12 @@ fn main() -> Result<()> {
         let today_local = Local::now().format("%Y-%m-%d").to_string();
         let cutoff      = (Local::now() - Duration::minutes(ecfg.max_signal_age_min)).format("%H:%M").to_string();
 
-        let equity = get_equity(&client, &cfg).unwrap_or(116.0);
+        let equity = match get_equity(&client, &cfg) {
+            Ok(e) => { println!("[bnb-executor] 💰 Equity={:.2}U trades={}", e, 0); e }
+            Err(err) => { println!("[bnb-executor] ⚠️  get_equity failed: {} — using fallback", err); 116.0 }
+        };
         let (realized_pnl, consec_losses, trade_count, cb_hit) = get_daily_stats(&live_conn, &today_utc, equity);
+        println!("[bnb-executor] 📊 PnL={:+.2}U losses={} trades={} dd={:.1}%", realized_pnl, consec_losses, trade_count, (-realized_pnl/equity.max(1.0))*100.0);
 
         let drawdown = if equity > 0.0 { -realized_pnl / equity } else { 0.0 };
         let risk_ok  = is_risk_ok(cb_hit, consec_losses, drawdown, cb_losses, max_dd);
