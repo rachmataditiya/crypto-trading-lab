@@ -13,6 +13,38 @@ use std::path::Path;
 ///
 /// Both sets are returned as PaperPosition entries; strategy.rs excludes
 /// candidates by symbol regardless of whether the position is truly open.
+/// Load symbols that were SKIPPED_STALE today from executor's processed_signals.
+/// Sim will exclude these from candidate evaluation to stop the SKIPPED_STALE replay loop.
+///
+/// Root cause: sim generates PAPER_TRADE for a coin that dumped 7% from signal entry.
+/// Executor correctly skips it (stale guard). But sim doesn't know price crashed, so it
+/// keeps re-generating PAPER_TRADE every 5 min → executor skips again → infinite loop.
+///
+/// Fix: sim reads executor's processed_signals, excludes any coin with SKIPPED_STALE today.
+/// The coin stays excluded until midnight UTC reset or it gets a new valid PAPER_TRADE.
+fn load_stale_skipped_symbols(workspace: &Path) -> Vec<String> {
+    use rusqlite::Connection;
+    let db_path = workspace.join("data/trading-journal/live_positions.db");
+    let conn = match Connection::open(&db_path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    // Use today UTC — processed_at is stored as UTC rfc3339
+    let today_utc = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let cutoff = format!("{}T00:00:00Z", today_utc);
+    let mut stmt = match conn.prepare(
+        "SELECT DISTINCT symbol FROM processed_signals \
+         WHERE status='SKIPPED_STALE' AND processed_at >= ?1",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map([&cutoff], |row| row.get::<_, String>(0))
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
 fn load_live_positions(workspace: &Path) -> Vec<PaperPosition> {
     use rusqlite::Connection;
     let db_path = workspace.join("data/trading-journal/live_positions.db");
@@ -97,6 +129,22 @@ pub fn run_cycle(
     //    This lets strategy exclude already-held symbols and correctly
     //    evaluate max_open_positions — previously SimState was always empty.
     state.open_positions = load_live_positions(workspace);
+
+    // 2b. Exclude coins that were SKIPPED_STALE today by executor.
+    //     These coins dumped from their signal entry price — re-generating
+    //     PAPER_TRADE for them is pointless until tomorrow (or price recovers).
+    //     Sim removes them from the snapshot so strategy never picks them.
+    let stale_symbols = load_stale_skipped_symbols(workspace);
+    let mut snapshot = snapshot;
+    if !stale_symbols.is_empty() {
+        let before = snapshot.coins.len();
+        snapshot.coins.retain(|c| !stale_symbols.contains(&c.symbol));
+        let after = snapshot.coins.len();
+        if before != after {
+            eprintln!("[SIM] Excluded {} stale-skipped coins today: {:?}",
+                before - after, stale_symbols);
+        }
+    }
 
     // 3. Update risk state
     risk::update_state(state, config);
