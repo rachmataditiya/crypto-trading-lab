@@ -25,8 +25,9 @@ const REST_BASE: &str = "https://www.okx.com";
 const BINANCE_REST_BASE: &str = "https://api.binance.com";
 
 // Deque capacity per timeframe
-const MAX_1M: usize = 120; // 2h of 1m closes
-const MAX_1H: usize = 120; // 5d of H1 closes
+const MAX_1M: usize = 120;  // 2h of 1m closes
+const MAX_15M: usize = 120; // 30h of 15m closes
+const MAX_1H: usize = 120;  // 5d of H1 closes
 const MAX_4H: usize = 120; // 20d of H4 closes
 const MAX_8H: usize = 60;  // ~15d of H6 closes (OKX has no 8H; using 6H)
 const MAX_12H: usize = 60; // ~30d of H12 closes
@@ -41,7 +42,7 @@ const BINANCE_SYMBOLS: &[&str] = &[
 ];
 
 /// Binance kline timeframes we subscribe to.
-const BINANCE_TIMEFRAMES: &[&str] = &["1h", "4h", "6h", "12h"];
+const BINANCE_TIMEFRAMES: &[&str] = &["15m", "1h", "4h", "6h", "12h"];
 
 // ── Credentials ────────────────────────────────────────────────────────────
 
@@ -140,6 +141,8 @@ pub struct SymbolState {
     #[serde(skip)]
     closes:     VecDeque<f64>, // 1m confirmed closes
     #[serde(skip)]
+    closes_15m: VecDeque<f64>, // 15m confirmed closes
+    #[serde(skip)]
     closes_1h:  VecDeque<f64>, // H1 confirmed closes
     #[serde(skip)]
     closes_4h:  VecDeque<f64>, // H4 confirmed closes
@@ -209,7 +212,7 @@ pub fn run_daemon(workspace: &Path, cfg: &RealtimeConfig) -> Result<(), String> 
     let mut backoff_secs = 1u64;
 
     // Seed historical candle data via REST before WS connects
-    eprintln!("[REALTIME] seeding H1/H4/H8/H12/D1 candle history via REST...");
+    eprintln!("[REALTIME] seeding 15m/H1/H4/H8/H12/D1 candle history via REST...");
     let _ = rest_poll_once(workspace, cfg, &mut cache);
     eprintln!(
         "[REALTIME] REST seed done — symbols with price: {}",
@@ -255,7 +258,7 @@ fn run_binance_ws_session(workspace: &Path) -> Result<(), String> {
         .map_err(|e| format!("binance rest client: {e}"))?;
 
     for &sym in BINANCE_SYMBOLS {
-        for &(tf, deque_max) in &[("1h", MAX_1H), ("4h", MAX_4H), ("6h", MAX_8H), ("12h", MAX_12H)] {
+        for &(tf, deque_max) in &[("15m", MAX_15M), ("1h", MAX_1H), ("4h", MAX_4H), ("6h", MAX_8H), ("12h", MAX_12H)] {
             if let Err(e) = fetch_binance_klines(&client, sym, tf, 120, deque_max, &mut cache) {
                 eprintln!("[BINANCE] REST seed {sym}/{tf}: {e}");
             }
@@ -271,6 +274,10 @@ fn run_binance_ws_session(workspace: &Path) -> Result<(), String> {
         "[BINANCE] REST seed done — symbols with data: {}",
         cache.symbols.values().filter(|s| s.closes_1h.len() >= 15).count()
     );
+    let now = Utc::now().to_rfc3339();
+    cache.generated_at = now.clone();
+    cache.health.last_update_at = now;
+    cache.health.last_update_age_secs = 0;
     persist_binance_cache(workspace, &cache)?;
 
     // ── WebSocket via data-stream.binance.vision (market-data-only CDN endpoint) ──
@@ -391,6 +398,7 @@ fn apply_binance_kline(txt: &str, cache: &mut RealtimeCache) -> bool {
     if !is_closed { return false; }
 
     match interval {
+        "15m" => push_close(&mut state.closes_15m, close, MAX_15M),
         "1h" => push_close(&mut state.closes_1h, close, MAX_1H),
         "4h" => push_close(&mut state.closes_4h, close, MAX_4H),
         "6h" => push_close(&mut state.closes_8h, close, MAX_8H),
@@ -447,6 +455,7 @@ fn fetch_binance_klines(
     // Binance REST klines: [[open_time, open, high, low, close, volume, close_time, ...], ...]
     // close = index [4], already in chronological order (oldest first)
     let deque = match interval {
+        "15m" => &mut state.closes_15m,
         "1h"  => &mut state.closes_1h,
         "4h"  => &mut state.closes_4h,
         "6h"  => &mut state.closes_8h,
@@ -565,6 +574,7 @@ fn run_ws_dual_session(
             let inst = to_okx_inst(s);
             vec![
                 serde_json::json!({"channel":"candle1m","instId":inst}),
+                serde_json::json!({"channel":"candle15m","instId":inst}),
                 serde_json::json!({"channel":"candle1H","instId":inst}),
                 serde_json::json!({"channel":"candle4H","instId":inst}),
                 serde_json::json!({"channel":"candle6H","instId":inst}),
@@ -584,8 +594,8 @@ fn run_ws_dual_session(
         thread::sleep(Duration::from_millis(400));
     }
     eprintln!(
-        "[REALTIME] candle WS subscribed ({} channels: 1m+1H+4H+6H+12H+1D × {} symbols)",
-        cfg.symbols.len() * 6,
+        "[REALTIME] candle WS subscribed ({} channels: 1m+15m+1H+4H+6H+12H+1D × {} symbols)",
+        cfg.symbols.len() * 7,
         cfg.symbols.len()
     );
 
@@ -726,6 +736,12 @@ fn apply_ws_message(txt: &str, cache: &mut RealtimeCache) {
         "candle1m" => {
             if let Some(close) = confirmed_close(arr) {
                 push_close(&mut state.closes, close, MAX_1M);
+                recompute_indicators(state);
+            }
+        }
+        "candle15m" => {
+            if let Some(close) = confirmed_close(arr) {
+                push_close(&mut state.closes_15m, close, MAX_15M);
                 recompute_indicators(state);
             }
         }
@@ -1023,6 +1039,9 @@ fn fetch_symbol_rest(
 
     // ── Seed 1m closes (100 candles) ───────────────────────────────────────
     fetch_candles_into(client, &inst, "1m",  100, &mut state.closes)?;
+
+    // ── Seed 15m closes (120 candles ≈ 30 hours) ────────────────────────────
+    fetch_candles_into(client, &inst, "15m", 120, &mut state.closes_15m)?;
 
     // ── Seed H1 closes (120 candles ≈ 5 days) ──────────────────────────────
     fetch_candles_into(client, &inst, "1H",  120, &mut state.closes_1h)?;
