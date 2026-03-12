@@ -368,14 +368,9 @@ pub fn compute_hmtf(input: &HmtfInput) -> HmtfSignal {
     // When volume is extreme (> 5x), lower to 22 — volume is a faster/stronger
     // confirmation than ADX (which lags 14 candles). SOL 2026-03-04 case:
     // vol=7.1x, adx_1h likely ~24, RSI=69 — should be Tier V but wasn't.
-    let adx_1h_threshold = if input.volume_ratio > 5.0 { 22.0 } else { 28.0 };
-    let v_breakout = tf_1h.score > 0.05
-        && adx_1h > adx_1h_threshold
-        && rsi_1h < 78.0
-        && (
-            (input.volume_ratio > 4.0 && alignment >= 2)
-            || (input.volume_ratio > 5.0 && alignment >= 1)
-        );
+    // Tier V disabled (EV negative — win rate 55% insufficient for 1:1 R:R after fees)
+    // v_breakout logic preserved here for future re-evaluation
+    let _adx_1h_threshold = if input.volume_ratio > 5.0 { 22.0 } else { 28.0 };
 
     // Tier F (Fast/1H momentum): fires when 1H signal is very strong but higher TFs lag.
     // Designed to catch fast oversold bounces early — addresses the "8 hour late entry" problem.
@@ -400,36 +395,32 @@ pub fn compute_hmtf(input: &HmtfInput) -> HmtfSignal {
             'A'
         } else if e_trend > 0.15 && alignment >= 3 {
             'B'
-        } else if v_breakout {
-            'V'
         } else if f_breakout {
             'F'
         } else {
             'C'
         }
     } else if rho < 0.4 {
-        // Ranging mode: R / V / F / C
+        // Ranging mode: R / F / C
+        // Tier V disabled — EV negative (win rate 55% insufficient for 1:1 R:R after 0.20% fee)
         if e_reversion > 0.08 && divergence_d > 0.15 {
             'R'
-        } else if v_breakout {
-            'V'
         } else if f_breakout {
             'F'
         } else {
             'C'
         }
     } else {
-        // Mixed (0.4 ≤ ρ ≤ 0.6): A / B / R / V / F / C
+        // Mixed (0.4 ≤ ρ ≤ 0.6): A / B / R / F / C
         // Tier B threshold is stricter in mixed (0.20 vs 0.15 in trending)
         // because regime conviction is lower — require stronger multi-TF signal.
+        // Tier V disabled — EV negative (win rate 55% insufficient for 1:1 R:R after 0.20% fee)
         if e_trend > 0.30 && alignment >= 3 {
             'A'
         } else if e_trend > 0.20 && alignment >= 3 {
             'B'
         } else if e_reversion > 0.08 && divergence_d > 0.15 {
             'R'
-        } else if v_breakout {
-            'V'
         } else if f_breakout {
             'F'
         } else {

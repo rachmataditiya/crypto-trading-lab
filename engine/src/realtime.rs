@@ -33,12 +33,21 @@ const MAX_8H: usize = 60;  // ~15d of H6 closes (OKX has no 8H; using 6H)
 const MAX_12H: usize = 60; // ~30d of H12 closes
 const MAX_1D: usize = 100; // 100d of D1 closes
 
-/// All 19 symbols tracked by the engine.
+/// All 30 symbols tracked by the engine.
 const BINANCE_SYMBOLS: &[&str] = &[
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-    "ADAUSDT", "DOTUSDT", "LINKUSDT", "LTCUSDT", "DOGEUSDT",
-    "AVAXUSDT", "MATICUSDT", "ATOMUSDT", "UNIUSDT", "FILUSDT",
-    "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT",
+    // Large cap
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    // Mid cap Layer 1
+    "ADAUSDT", "AVAXUSDT", "DOTUSDT", "NEARUSDT", "ATOMUSDT",
+    // DeFi
+    "UNIUSDT", "AAVEUSDT", "LINKUSDT", "MKRUSDT",
+    // Layer 2 / Ecosystem
+    "MATICUSDT", "ARBUSDT", "OPUSDT", "APTUSDT", "SUIUSDT",
+    // Meme / High beta
+    "DOGEUSDT", "WIFUSDT",
+    // Other high-liquidity
+    "LTCUSDT", "FILUSDT", "INJUSDT", "TIAUSDT",
+    "FETUSDT", "RENDERUSDT", "THETAUSDT", "RUNEUSDT",
 ];
 
 /// Binance kline timeframes we subscribe to.
