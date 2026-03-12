@@ -273,45 +273,83 @@ fn run_binance_ws_session(workspace: &Path) -> Result<(), String> {
     );
     persist_binance_cache(workspace, &cache)?;
 
-    // ── REST polling loop (replaces WS — stream.binance.com geo-blocked) ──
-    // Poll all symbols × timeframes every 30s. Sufficient for 1H/4H/6H/12H indicators.
-    // WS approach blocked because Binance stream endpoints not reachable via Warp in ID.
-    cache.health.ws_connected = true; // REST poll = "connected" semantically
+    // ── WebSocket via data-stream.binance.vision (market-data-only CDN endpoint) ──
+    // Docs: "wss://data-stream.binance.vision can be subscribed to receive only market data"
+    // This endpoint is accessible from ID via Warp. Strategy: connect to /stream then
+    // SUBSCRIBE via JSON (avoids very-long URL that might cause tungstenite issues).
+    let ws_url = "wss://data-stream.binance.vision:9443/stream";
+    eprintln!("[BINANCE] connecting WS to {}...", ws_url);
+    let (mut sock, _) = connect(ws_url).map_err(|e| format!("binance ws connect: {e}"))?;
+
+    // Subscribe to all streams via JSON message (instead of URL params)
+    let streams: Vec<String> = BINANCE_SYMBOLS
+        .iter()
+        .flat_map(|s| {
+            let lower = s.to_lowercase();
+            BINANCE_TIMEFRAMES.iter().map(move |tf| format!("{lower}@kline_{tf}"))
+        })
+        .collect();
+    let sub_msg = serde_json::json!({
+        "method": "SUBSCRIBE",
+        "params": streams,
+        "id": 1
+    }).to_string();
+    sock.send(Message::Text(sub_msg)).map_err(|e| format!("binance ws subscribe: {e}"))?;
+
+    set_nonblocking(sock.get_mut()).map_err(|e| format!("binance nonblocking: {e}"))?;
+
+    cache.health.ws_connected = true;
     cache.health.fallback_active = false;
-    eprintln!("[BINANCE] REST poll mode active (30s interval, {} symbols)", BINANCE_SYMBOLS.len());
+    eprintln!("[BINANCE] WS connected, subscribed to {} streams", streams.len());
+    // Persist immediately so health shows ws_connected=true before first candle close
+    persist_binance_cache(workspace, &cache).ok();
+
+    let mut last_msg     = Instant::now();
+    let mut last_persist = Instant::now();
 
     loop {
-        let poll_start = Instant::now();
-        let mut updated = 0usize;
+        let mut changed = false;
 
-        for &sym in BINANCE_SYMBOLS {
-            for &(tf, deque_max) in &[("1h", MAX_1H), ("4h", MAX_4H), ("6h", MAX_8H), ("12h", MAX_12H)] {
-                // Only fetch latest 2 candles (current + last confirmed)
-                if let Err(e) = fetch_binance_klines(&client, sym, tf, 2, deque_max, &mut cache) {
-                    eprintln!("[BINANCE] poll {sym}/{tf}: {e}");
+        match sock.read() {
+            Ok(Message::Text(txt)) => {
+                // Skip subscribe ACK {"result":null,"id":1}
+                if txt.contains("\"result\"") { continue; }
+                if apply_binance_kline(&txt, &mut cache) {
+                    changed = true;
                 }
-                thread::sleep(Duration::from_millis(60)); // ~19×4×60ms = ~4.5s total
+                last_msg = Instant::now();
             }
-            if let Some(state) = cache.symbols.get_mut(sym) {
-                recompute_indicators(state);
-                state.updated_at = Utc::now().to_rfc3339();
-                if state.price > 0.0 { updated += 1; }
+            Ok(Message::Ping(d)) => {
+                let _ = sock.send(Message::Pong(d));
             }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(ref e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("binance ws read: {e}")),
         }
 
-        let now = Utc::now().to_rfc3339();
-        cache.generated_at = now.clone();
-        cache.health.last_update_at = now;
-        cache.health.last_update_age_secs = 0;
-        cache.health.stale_feed = false;
-        persist_binance_cache(workspace, &cache)?;
-        eprintln!("[BINANCE] poll cycle done — {updated} symbols updated");
+        // Persist at most once per 2 seconds
+        if changed && last_persist.elapsed() >= Duration::from_secs(2) {
+            let now = Utc::now().to_rfc3339();
+            cache.generated_at = now.clone();
+            cache.health.last_update_at = now;
+            cache.health.last_update_age_secs = 0;
+            cache.health.stale_feed = false;
+            persist_binance_cache(workspace, &cache)?;
+            last_persist = Instant::now();
+        }
 
-        // Sleep remainder of 30s interval
-        let elapsed = poll_start.elapsed();
-        let target = Duration::from_secs(30);
-        if elapsed < target {
-            thread::sleep(target - elapsed);
+        // Stale feed detection (90s — klines update every 2s per docs)
+        let age = last_msg.elapsed().as_secs();
+        cache.health.last_update_age_secs = age;
+        if age > 90 {
+            cache.health.stale_feed = true;
+            return Err(format!("binance stale feed ({age}s)"));
+        }
+
+        if !changed {
+            thread::sleep(Duration::from_millis(10));
         }
     }
 }
