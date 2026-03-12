@@ -21,6 +21,9 @@ const WS_TICKER_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
 const WS_CANDLE_URL: &str = "wss://ws.okx.com:8443/ws/v5/business";
 const REST_BASE: &str = "https://www.okx.com";
 
+// Binance combined stream endpoint (no auth needed)
+const BINANCE_REST_BASE: &str = "https://api.binance.com";
+
 // Deque capacity per timeframe
 const MAX_1M: usize = 120; // 2h of 1m closes
 const MAX_1H: usize = 120; // 5d of H1 closes
@@ -28,6 +31,17 @@ const MAX_4H: usize = 120; // 20d of H4 closes
 const MAX_8H: usize = 60;  // ~15d of H6 closes (OKX has no 8H; using 6H)
 const MAX_12H: usize = 60; // ~30d of H12 closes
 const MAX_1D: usize = 100; // 100d of D1 closes
+
+/// All 19 symbols tracked by the engine.
+const BINANCE_SYMBOLS: &[&str] = &[
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    "ADAUSDT", "DOTUSDT", "LINKUSDT", "LTCUSDT", "DOGEUSDT",
+    "AVAXUSDT", "MATICUSDT", "ATOMUSDT", "UNIUSDT", "FILUSDT",
+    "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT",
+];
+
+/// Binance kline timeframes we subscribe to.
+const BINANCE_TIMEFRAMES: &[&str] = &["1h", "4h", "6h", "12h"];
 
 // ── Credentials ────────────────────────────────────────────────────────────
 
@@ -171,6 +185,25 @@ pub fn run_daemon(workspace: &Path, cfg: &RealtimeConfig) -> Result<(), String> 
     let creds = load_creds(workspace)?;
     eprintln!("[REALTIME] OKX credentials loaded (key: {}...)", &creds.api_key[..8]);
 
+    // ── Spawn Binance WS session in a separate thread ────────────────────
+    let binance_workspace = workspace.to_path_buf();
+    thread::spawn(move || {
+        eprintln!("[BINANCE] starting Binance WS thread...");
+        let mut backoff = 1u64;
+        loop {
+            match run_binance_ws_session(&binance_workspace) {
+                Ok(()) => backoff = 1,
+                Err(e) => {
+                    eprintln!("[BINANCE] session error: {e}");
+                    let jitter = rand::thread_rng().gen_range(0..=700u64);
+                    eprintln!("[BINANCE] reconnect in {backoff}s...");
+                    thread::sleep(Duration::from_millis(backoff * 1000 + jitter));
+                    backoff = (backoff * 2).min(60);
+                }
+            }
+        }
+    });
+
     let mut cache = RealtimeCache::default();
     cache.health.provider = cfg.provider.clone();
     let mut backoff_secs = 1u64;
@@ -205,6 +238,233 @@ pub fn run_daemon(workspace: &Path, cfg: &RealtimeConfig) -> Result<(), String> 
             }
         }
     }
+}
+
+// ── Binance WebSocket session ────────────────────────────────────────────────
+
+fn run_binance_ws_session(workspace: &Path) -> Result<(), String> {
+    let mut cache = RealtimeCache::default();
+    cache.health.provider = "binance".to_string();
+
+    // ── Seed historical klines via REST ─────────────────────────────────
+    eprintln!("[BINANCE] seeding candle history via REST...");
+    let client = Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent("binance-rs-client/1.0")
+        .build()
+        .map_err(|e| format!("binance rest client: {e}"))?;
+
+    for &sym in BINANCE_SYMBOLS {
+        for &(tf, deque_max) in &[("1h", MAX_1H), ("4h", MAX_4H), ("6h", MAX_8H), ("12h", MAX_12H)] {
+            if let Err(e) = fetch_binance_klines(&client, sym, tf, 120, deque_max, &mut cache) {
+                eprintln!("[BINANCE] REST seed {sym}/{tf}: {e}");
+            }
+            thread::sleep(Duration::from_millis(100)); // rate-limit courtesy
+        }
+        // Recompute indicators after seeding all timeframes for this symbol
+        if let Some(state) = cache.symbols.get_mut(sym) {
+            recompute_indicators(state);
+            state.updated_at = Utc::now().to_rfc3339();
+        }
+    }
+    eprintln!(
+        "[BINANCE] REST seed done — symbols with data: {}",
+        cache.symbols.values().filter(|s| s.closes_1h.len() >= 15).count()
+    );
+    persist_binance_cache(workspace, &cache)?;
+
+    // ── Build combined stream URL ──────────────────────────────────────
+    let streams: Vec<String> = BINANCE_SYMBOLS
+        .iter()
+        .flat_map(|s| {
+            let lower = s.to_lowercase();
+            BINANCE_TIMEFRAMES.iter().map(move |tf| format!("{lower}@kline_{tf}"))
+        })
+        .collect();
+    let url = format!("wss://stream.binance.com/stream?streams={}", streams.join("/"));
+
+    eprintln!("[BINANCE] connecting WS ({} streams)...", streams.len());
+    let (mut sock, _) = connect(&url).map_err(|e| format!("binance ws connect: {e}"))?;
+    set_nonblocking(sock.get_mut()).map_err(|e| format!("binance nonblocking: {e}"))?;
+
+    cache.health.ws_connected = true;
+    cache.health.fallback_active = false;
+
+    let mut last_msg     = Instant::now();
+    let mut last_persist = Instant::now();
+
+    loop {
+        let mut changed = false;
+
+        match sock.read() {
+            Ok(Message::Text(txt)) => {
+                if apply_binance_kline(&txt, &mut cache) {
+                    changed = true;
+                }
+                last_msg = Instant::now();
+            }
+            Ok(Message::Ping(d)) => {
+                let _ = sock.send(Message::Pong(d));
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(ref e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("binance ws read: {e}")),
+        }
+
+        // Persist at most once per second
+        if changed && last_persist.elapsed() >= Duration::from_secs(1) {
+            let now = Utc::now().to_rfc3339();
+            cache.generated_at = now.clone();
+            cache.health.last_update_at = now;
+            cache.health.last_update_age_secs = 0;
+            cache.health.stale_feed = false;
+            persist_binance_cache(workspace, &cache)?;
+            last_persist = Instant::now();
+        }
+
+        // Stale feed detection (90s for Binance — klines come less frequently than tickers)
+        let age = last_msg.elapsed().as_secs();
+        cache.health.last_update_age_secs = age;
+        if age > 90 {
+            cache.health.stale_feed = true;
+            return Err(format!("binance stale feed ({age}s)"));
+        }
+
+        if !changed {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Parse a Binance combined-stream kline event and update cache.
+/// Returns true if a confirmed candle was processed.
+fn apply_binance_kline(txt: &str, cache: &mut RealtimeCache) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(txt) else { return false };
+    let data = match v.get("data") {
+        Some(d) => d,
+        None => return false,
+    };
+    let k = match data.get("k") {
+        Some(k) => k,
+        None => return false,
+    };
+
+    let symbol = match k.get("s").and_then(|x| x.as_str()) {
+        Some(s) => s.to_string(), // Already uppercase from Binance
+        None => return false,
+    };
+    let interval = match k.get("i").and_then(|x| x.as_str()) {
+        Some(i) => i,
+        None => return false,
+    };
+    let is_closed = k.get("x").and_then(|x| x.as_bool()).unwrap_or(false);
+
+    let close: f64 = parse_binance_num(k.get("c"));
+    if close <= 0.0 { return false; }
+
+    let state = cache.symbols.entry(symbol.clone()).or_insert_with(|| SymbolState {
+        symbol: symbol.clone(),
+        ..Default::default()
+    });
+
+    // Always update latest price
+    state.price = close;
+
+    if !is_closed { return false; }
+
+    match interval {
+        "1h" => push_close(&mut state.closes_1h, close, MAX_1H),
+        "4h" => push_close(&mut state.closes_4h, close, MAX_4H),
+        "6h" => push_close(&mut state.closes_8h, close, MAX_8H),
+        "12h" => push_close(&mut state.closes_12h, close, MAX_12H),
+        _ => return false,
+    }
+
+    // Volume ratio from kline volume
+    let vol_quote: f64 = parse_binance_num(k.get("q")); // quote asset volume
+    let baseline = volume_baseline(&symbol);
+    if vol_quote > 0.0 {
+        state.volume_ratio = sanitize::volume_ratio(vol_quote / baseline);
+    }
+
+    recompute_indicators(state);
+    state.updated_at = Utc::now().to_rfc3339();
+    true
+}
+
+/// Parse a number from a Binance JSON field (always string in kline data).
+fn parse_binance_num(v: Option<&serde_json::Value>) -> f64 {
+    match v {
+        Some(serde_json::Value::String(s)) => s.parse::<f64>().unwrap_or(0.0),
+        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// Fetch historical klines from Binance REST and populate the correct deque.
+fn fetch_binance_klines(
+    client: &Client,
+    symbol: &str,
+    interval: &str,
+    limit: usize,
+    max_deque: usize,
+    cache: &mut RealtimeCache,
+) -> Result<(), String> {
+    let url = format!(
+        "{BINANCE_REST_BASE}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    );
+    let resp = client.get(&url).send()
+        .map_err(|e| format!("binance klines({interval}) send: {e}"))?;
+    if resp.status().as_u16() == 429 {
+        return Err(format!("429 binance klines {interval}"));
+    }
+    let rows: Vec<serde_json::Value> = resp.json()
+        .map_err(|e| format!("binance klines({interval}) json: {e}"))?;
+
+    let state = cache.symbols.entry(symbol.to_string()).or_insert_with(|| SymbolState {
+        symbol: symbol.to_string(),
+        ..Default::default()
+    });
+
+    // Binance REST klines: [[open_time, open, high, low, close, volume, close_time, ...], ...]
+    // close = index [4], already in chronological order (oldest first)
+    let deque = match interval {
+        "1h"  => &mut state.closes_1h,
+        "4h"  => &mut state.closes_4h,
+        "6h"  => &mut state.closes_8h,
+        "12h" => &mut state.closes_12h,
+        _ => return Ok(()),
+    };
+
+    deque.clear();
+    for row in &rows {
+        if let Some(arr) = row.as_array() {
+            if let Some(close) = arr.get(4).and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                push_close(deque, close, max_deque);
+            }
+        }
+    }
+
+    // Update price from the last kline close
+    if let Some(&last) = deque.back() {
+        if state.price <= 0.0 {
+            state.price = last;
+        }
+    }
+
+    Ok(())
+}
+
+fn persist_binance_cache(workspace: &Path, cache: &RealtimeCache) -> Result<(), String> {
+    let path = workspace.join("data/trading-journal/binance_cache.json");
+    if let Some(p) = path.parent() {
+        fs::create_dir_all(p).map_err(|e| format!("mkdir binance cache: {e}"))?;
+    }
+    let body = serde_json::to_string_pretty(cache).map_err(|e| format!("binance cache json: {e}"))?;
+    fs::write(&path, body).map_err(|e| format!("binance cache write: {e}"))?;
+    Ok(())
 }
 
 // ── Dual WebSocket session ──────────────────────────────────────────────────
@@ -997,5 +1257,83 @@ mod tests {
         recompute_indicators(&mut state);
         assert_eq!(state.ret_1h, 0.0,
             "No 1H closes → ret_1h must be 0.0 (fail-open), got {:.4}", state.ret_1h);
+    }
+
+    // ── Binance kline parsing ────────────────────────────────────────────
+
+    fn binance_kline_event(symbol: &str, interval: &str, close: &str, is_closed: bool) -> String {
+        json!({
+            "stream": format!("{}@kline_{}", symbol.to_lowercase(), interval),
+            "data": {
+                "k": {
+                    "s": symbol,
+                    "i": interval,
+                    "o": "57000.00",
+                    "h": "57600.00",
+                    "l": "56900.00",
+                    "c": close,
+                    "v": "1000.00",
+                    "q": "57500000.00",
+                    "x": is_closed
+                }
+            }
+        }).to_string()
+    }
+
+    #[test]
+    fn binance_kline_confirmed_close_updates_cache() {
+        let mut cache = RealtimeCache::default();
+        let msg = binance_kline_event("BTCUSDT", "1h", "57500.00", true);
+        let changed = apply_binance_kline(&msg, &mut cache);
+        assert!(changed, "Confirmed kline must return true");
+        let state = cache.symbols.get("BTCUSDT").expect("BTCUSDT must exist");
+        assert!((state.price - 57500.0).abs() < 0.01, "Price must be 57500");
+        assert_eq!(state.closes_1h.len(), 1, "1h deque must have 1 entry");
+        assert!((state.closes_1h[0] - 57500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn binance_kline_unconfirmed_updates_price_only() {
+        let mut cache = RealtimeCache::default();
+        let msg = binance_kline_event("ETHUSDT", "4h", "3200.00", false);
+        let changed = apply_binance_kline(&msg, &mut cache);
+        assert!(!changed, "Unconfirmed kline must return false");
+        let state = cache.symbols.get("ETHUSDT").expect("ETHUSDT must exist");
+        assert!((state.price - 3200.0).abs() < 0.01, "Price must be updated");
+        assert_eq!(state.closes_4h.len(), 0, "4h deque must be empty (not confirmed)");
+    }
+
+    #[test]
+    fn binance_kline_routes_to_correct_timeframe_deque() {
+        let mut cache = RealtimeCache::default();
+        // 4h confirmed close
+        apply_binance_kline(&binance_kline_event("SOLUSDT", "4h", "150.00", true), &mut cache);
+        // 6h confirmed close
+        apply_binance_kline(&binance_kline_event("SOLUSDT", "6h", "151.00", true), &mut cache);
+        // 12h confirmed close
+        apply_binance_kline(&binance_kline_event("SOLUSDT", "12h", "152.00", true), &mut cache);
+
+        let state = cache.symbols.get("SOLUSDT").unwrap();
+        assert_eq!(state.closes_4h.len(), 1, "4h deque must have 1");
+        assert_eq!(state.closes_8h.len(), 1, "6h→8h deque must have 1");
+        assert_eq!(state.closes_12h.len(), 1, "12h deque must have 1");
+        assert!((state.closes_8h[0] - 151.0).abs() < 0.01, "6h close must be 151");
+    }
+
+    #[test]
+    fn binance_kline_ignores_malformed_json() {
+        let mut cache = RealtimeCache::default();
+        assert!(!apply_binance_kline("not json", &mut cache));
+        assert!(!apply_binance_kline("{}", &mut cache));
+        assert!(!apply_binance_kline(r#"{"data":{}}"#, &mut cache));
+    }
+
+    #[test]
+    fn parse_binance_num_handles_string_and_number() {
+        let s = json!("123.45");
+        assert!((parse_binance_num(Some(&s)) - 123.45).abs() < 0.001);
+        let n = json!(678.9);
+        assert!((parse_binance_num(Some(&n)) - 678.9).abs() < 0.001);
+        assert_eq!(parse_binance_num(None), 0.0);
     }
 }
