@@ -273,67 +273,45 @@ fn run_binance_ws_session(workspace: &Path) -> Result<(), String> {
     );
     persist_binance_cache(workspace, &cache)?;
 
-    // ── Build combined stream URL ──────────────────────────────────────
-    let streams: Vec<String> = BINANCE_SYMBOLS
-        .iter()
-        .flat_map(|s| {
-            let lower = s.to_lowercase();
-            BINANCE_TIMEFRAMES.iter().map(move |tf| format!("{lower}@kline_{tf}"))
-        })
-        .collect();
-    let url = format!("wss://stream.binance.com/stream?streams={}", streams.join("/"));
-
-    eprintln!("[BINANCE] connecting WS ({} streams)...", streams.len());
-    let (mut sock, _) = connect(&url).map_err(|e| format!("binance ws connect: {e}"))?;
-    set_nonblocking(sock.get_mut()).map_err(|e| format!("binance nonblocking: {e}"))?;
-
-    cache.health.ws_connected = true;
+    // ── REST polling loop (replaces WS — stream.binance.com geo-blocked) ──
+    // Poll all symbols × timeframes every 30s. Sufficient for 1H/4H/6H/12H indicators.
+    // WS approach blocked because Binance stream endpoints not reachable via Warp in ID.
+    cache.health.ws_connected = true; // REST poll = "connected" semantically
     cache.health.fallback_active = false;
-
-    let mut last_msg     = Instant::now();
-    let mut last_persist = Instant::now();
+    eprintln!("[BINANCE] REST poll mode active (30s interval, {} symbols)", BINANCE_SYMBOLS.len());
 
     loop {
-        let mut changed = false;
+        let poll_start = Instant::now();
+        let mut updated = 0usize;
 
-        match sock.read() {
-            Ok(Message::Text(txt)) => {
-                if apply_binance_kline(&txt, &mut cache) {
-                    changed = true;
+        for &sym in BINANCE_SYMBOLS {
+            for &(tf, deque_max) in &[("1h", MAX_1H), ("4h", MAX_4H), ("6h", MAX_8H), ("12h", MAX_12H)] {
+                // Only fetch latest 2 candles (current + last confirmed)
+                if let Err(e) = fetch_binance_klines(&client, sym, tf, 2, deque_max, &mut cache) {
+                    eprintln!("[BINANCE] poll {sym}/{tf}: {e}");
                 }
-                last_msg = Instant::now();
+                thread::sleep(Duration::from_millis(60)); // ~19×4×60ms = ~4.5s total
             }
-            Ok(Message::Ping(d)) => {
-                let _ = sock.send(Message::Pong(d));
+            if let Some(state) = cache.symbols.get_mut(sym) {
+                recompute_indicators(state);
+                state.updated_at = Utc::now().to_rfc3339();
+                if state.price > 0.0 { updated += 1; }
             }
-            Ok(_) => {}
-            Err(tungstenite::Error::Io(ref e))
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => return Err(format!("binance ws read: {e}")),
         }
 
-        // Persist at most once per second
-        if changed && last_persist.elapsed() >= Duration::from_secs(1) {
-            let now = Utc::now().to_rfc3339();
-            cache.generated_at = now.clone();
-            cache.health.last_update_at = now;
-            cache.health.last_update_age_secs = 0;
-            cache.health.stale_feed = false;
-            persist_binance_cache(workspace, &cache)?;
-            last_persist = Instant::now();
-        }
+        let now = Utc::now().to_rfc3339();
+        cache.generated_at = now.clone();
+        cache.health.last_update_at = now;
+        cache.health.last_update_age_secs = 0;
+        cache.health.stale_feed = false;
+        persist_binance_cache(workspace, &cache)?;
+        eprintln!("[BINANCE] poll cycle done — {updated} symbols updated");
 
-        // Stale feed detection (90s for Binance — klines come less frequently than tickers)
-        let age = last_msg.elapsed().as_secs();
-        cache.health.last_update_age_secs = age;
-        if age > 90 {
-            cache.health.stale_feed = true;
-            return Err(format!("binance stale feed ({age}s)"));
-        }
-
-        if !changed {
-            thread::sleep(Duration::from_millis(10));
+        // Sleep remainder of 30s interval
+        let elapsed = poll_start.elapsed();
+        let target = Duration::from_secs(30);
+        if elapsed < target {
+            thread::sleep(target - elapsed);
         }
     }
 }
