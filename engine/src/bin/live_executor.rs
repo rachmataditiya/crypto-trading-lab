@@ -844,6 +844,8 @@ fn init_live_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN ams_tier TEXT DEFAULT 'X'", params![]);
     // Idempotent migration: add exchange column to processed_signals (ignore if already exists)
     conn.execute("ALTER TABLE processed_signals ADD COLUMN exchange TEXT DEFAULT 'okx'", params![]).ok();
+    // Idempotent: ensure dedup index exists for INSERT OR IGNORE to work correctly
+    conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_ps_sig_exch ON processed_signals(signal_id, exchange);")?;
     Ok(())
 }
 

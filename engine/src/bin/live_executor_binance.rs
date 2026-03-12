@@ -938,6 +938,8 @@ fn init_live_db(conn: &Connection) -> Result<()> {
             circuit_breaker_hit INTEGER DEFAULT 0
         );
     ")?;
+    // Idempotent: ensure dedup index exists for INSERT OR IGNORE to work correctly
+    conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_ps_sig_exch ON processed_signals(signal_id, exchange);")?;
     // Idempotent migrations for new columns (ALTER TABLE ignores error if column exists)
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN tp2_price REAL", params![]);
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN half_exited INTEGER DEFAULT 0", params![]);
@@ -1388,21 +1390,18 @@ fn main() -> Result<()> {
                         } else {
                             // Wait for buy to settle before placing SL/TP algo orders
                             thread::sleep(StdDuration::from_secs(3));
-                            // Query actual received coin qty (after OKX fee deduction).
+                            // Query actual received coin qty (after Binance fee deduction).
                             // Using computed qty = usdt/fill over-estimates by ~0.1% (fee).
                             // Always use actual available balance as source of truth.
-                            let ccy = inst.split('-').next().unwrap_or(&inst);
-                            let avail_after = get_avail_coin(&mut ws, ccy);
+                            let ccy = sig.symbol.replace("USDT", "");
+                            let avail_after = get_avail_coin(&mut ws, &ccy);
                             let actual_qty = if avail_after > 0.0 && avail_after < qty {
                                 println!("[executor] ℹ️  Actual received qty {:.6} {} (computed {:.6}, fee adj {:.4}%)",
-                                    avail_after, ccy, qty, (1.0 - avail_after/qty)*100.0);
+                                    avail_after, &ccy, qty, (1.0 - avail_after/qty)*100.0);
                                 avail_after
                             } else { qty };
-                            // SL algo order on OKX = hard stop (crash protection).
-                            // TP is handled by executor polling (software TP1/TP2/trail).
-                            // We do NOT place a separate TP limit order because OKX locks the full
-                            // coin balance for the SL algo order, causing TP limit to always fail
-                            // with "insufficient balance" — conflicting orders on simple spot.
+                            // OCO order on Binance = hard stop + TP in one order.
+                            // Software monitoring (RSI exit, trail, time) cancels OCO before selling.
                             let entry_rsi = get_rsi_from_cache(&sig.symbol, &base);
                             let hold_min_tier = tier_aware_hold_min(&ecfg, &sig.symbol, ams_tier_char, entry_rsi);
                             // OCO algo order: SL + TP in one order — no balance lock conflict.

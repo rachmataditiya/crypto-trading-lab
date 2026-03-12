@@ -187,6 +187,10 @@ pub fn run_backfill(
     let mut results = Vec::new();
     let now = chrono::Local::now();
 
+    // Sync live open positions so strategy excludes already-held symbols
+    state.open_positions = load_live_positions(workspace);
+    let stale_symbols = load_stale_skipped_symbols(workspace);
+
     for h in (0..hours).rev() {
         let ts = now - chrono::Duration::hours(h as i64);
         let (snapshot, signal) = if config.realtime.enabled {
@@ -202,6 +206,11 @@ pub fn run_backfill(
                 data_feed::parse_signal_file(workspace)?,
             )
         };
+        // Exclude stale-skipped coins (same as run_cycle)
+        let mut snapshot = snapshot;
+        if !stale_symbols.is_empty() {
+            snapshot.coins.retain(|c| !stale_symbols.contains(&c.symbol));
+        }
         let news_context = data_feed::load_news_context(workspace);
 
         risk::update_state(&mut state, config);
