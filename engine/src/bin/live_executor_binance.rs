@@ -6,18 +6,14 @@
 /// - SL below fill price fix + safety gate
 
 use anyhow::{anyhow, Result};
-// base64 not needed for Binance (uses hex signature)
 use chrono::{DateTime, Duration, Local, Timelike, Utc};
 use hmac::{Hmac, Mac};
-use reqwest::blocking::Client;
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::{collections::HashMap, fs, path::{Path, PathBuf}, thread, time::Duration as StdDuration};
-
-// ── Constants ────────────────────────────────────────────────────────────────
-const BINANCE_BASE: &str = "https://api.binance.com"; // verified working with Warp VPN
+use std::{collections::HashMap, fs, net::TcpStream, path::{Path, PathBuf}, thread, time::Duration as StdDuration};
+use tungstenite::{connect, stream::MaybeTlsStream, Message, WebSocket};
 use hex;
 
 // ── Executor Config (loaded from executor_config.json) ───────────────────────
@@ -199,71 +195,138 @@ fn signal_tier(sig: &Signal, ecfg: &ExecutorConfig) -> &'static str {
     else { "C" }
 }
 
-// ── Binance Auth ─────────────────────────────────────────────────────────────
+// ── Binance WebSocket API Client ─────────────────────────────────────────────
+const BINANCE_WS_API: &str = "wss://ws-api.binance.com:443/ws-api/v3";
+
+/// HMAC-SHA256 signature (hex-encoded) for Binance API.
 fn bnb_sign(secret: &str, query: &str) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(query.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
 
-fn bnb_get(client: &Client, cfg: &Config, path: &str, extra_params: &str) -> Result<Value> {
-    let ts = Utc::now().timestamp_millis();
-    let query = if extra_params.is_empty() {
-        format!("recvWindow=10000&timestamp={}", ts)
-    } else {
-        format!("{}&recvWindow=10000&timestamp={}", extra_params, ts)
-    };
-    let sig = bnb_sign(&cfg.secret_key, &query);
-    let url = format!("{}{}?{}&signature={}", BINANCE_BASE, path, query, sig);
-    let r = client.get(&url)
-        .header("X-MBX-APIKEY", &cfg.api_key)
-        .send()?.json::<Value>()?;
-    Ok(r)
+/// Build sorted query string from key-value pairs for WS API signing.
+/// Params are sorted alphabetically by key, then joined as key=value&key=value.
+fn build_sorted_query(params: &[(String, String)]) -> String {
+    let mut sorted: Vec<_> = params.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    sorted.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&")
 }
 
-fn bnb_post(client: &Client, cfg: &Config, path: &str, params: &str) -> Result<Value> {
-    let ts = Utc::now().timestamp_millis();
-    let query = if params.is_empty() {
-        format!("recvWindow=10000&timestamp={}", ts)
-    } else {
-        format!("{}&recvWindow=10000&timestamp={}", params, ts)
-    };
-    let sig = bnb_sign(&cfg.secret_key, &query);
-    let body = format!("{}&signature={}", query, sig);
-    let r = client.post(format!("{}{}", BINANCE_BASE, path))
-        .header("X-MBX-APIKEY", &cfg.api_key)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(body).send()?.json::<Value>()?;
-    Ok(r)
+struct BinanceWsClient {
+    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    api_key: String,
+    secret_key: String,
+    request_id: u64,
 }
 
-fn bnb_delete(client: &Client, cfg: &Config, path: &str, params: &str) -> Result<Value> {
-    let ts = Utc::now().timestamp_millis();
-    let query = if params.is_empty() {
-        format!("timestamp={}", ts)
-    } else {
-        format!("{}&timestamp={}", params, ts)
-    };
-    let sig = bnb_sign(&cfg.secret_key, &query);
-    let url = format!("{}{}?{}&signature={}", BINANCE_BASE, path, query, sig);
-    let r = client.delete(&url)
-        .header("X-MBX-APIKEY", &cfg.api_key)
-        .send()?.json::<Value>()?;
-    Ok(r)
-}
+impl BinanceWsClient {
+    fn connect(api_key: &str, secret_key: &str) -> Result<Self> {
+        let (socket, _) = connect(BINANCE_WS_API)
+            .map_err(|e| anyhow!("WS connect to {} failed: {}", BINANCE_WS_API, e))?;
+        println!("[bnb-executor] 🔌 WebSocket connected to ws-api.binance.com");
+        Ok(Self {
+            socket,
+            api_key: api_key.to_string(),
+            secret_key: secret_key.to_string(),
+            request_id: 0,
+        })
+    }
 
-// Stub to satisfy internal calls that use okx_get/okx_post pattern
-// These are not used in Binance executor but referenced by shared helpers
-fn okx_get(_client: &Client, _cfg: &Config, _path: &str) -> Result<Value> {
-    Err(anyhow!("okx_get called in Binance executor — should not happen"))
-}
-fn okx_post(_client: &Client, _cfg: &Config, _path: &str, _body: &Value) -> Result<Value> {
-    Err(anyhow!("okx_post called in Binance executor — should not happen"))
+    fn reconnect(&mut self) -> Result<()> {
+        let _ = self.socket.close(None);
+        let (socket, _) = connect(BINANCE_WS_API)
+            .map_err(|e| anyhow!("WS reconnect failed: {}", e))?;
+        self.socket = socket;
+        println!("[bnb-executor] 🔄 WebSocket reconnected");
+        Ok(())
+    }
+
+    /// Send an authenticated WS API request and wait for the matching response.
+    /// Returns the `result` field on success, or an error.
+    fn request(&mut self, method: &str, extra_params: &[(&str, String)]) -> Result<Value> {
+        self.request_inner(method, extra_params, true)
+    }
+
+    /// Send a public (unauthenticated) WS API request.
+    fn request_public(&mut self, method: &str, extra_params: &[(&str, String)]) -> Result<Value> {
+        self.request_inner(method, extra_params, false)
+    }
+
+    fn request_inner(&mut self, method: &str, extra_params: &[(&str, String)], signed: bool) -> Result<Value> {
+        self.request_id += 1;
+        let req_id = format!("r{}", self.request_id);
+
+        // Build params
+        let mut params: Vec<(String, String)> = extra_params.iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+
+        if signed {
+            let ts = Utc::now().timestamp_millis();
+            params.push(("apiKey".to_string(), self.api_key.clone()));
+            params.push(("recvWindow".to_string(), "10000".to_string()));
+            params.push(("timestamp".to_string(), ts.to_string()));
+
+            // Sign: sorted query string → HMAC-SHA256
+            let query = build_sorted_query(&params);
+            let sig = bnb_sign(&self.secret_key, &query);
+            params.push(("signature".to_string(), sig));
+        }
+
+        // Build JSON params object
+        let params_obj: serde_json::Map<String, Value> = params.iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect();
+
+        let request = json!({
+            "id": req_id,
+            "method": method,
+            "params": params_obj
+        });
+
+        // Send
+        self.socket.send(Message::Text(request.to_string()))
+            .map_err(|e| anyhow!("WS send failed: {}", e))?;
+
+        // Read responses until we find our matching id (timeout 15s)
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(15);
+        loop {
+            if std::time::Instant::now() > deadline {
+                return Err(anyhow!("WS response timeout for {} (id={})", method, req_id));
+            }
+            match self.socket.read() {
+                Ok(Message::Text(txt)) => {
+                    let resp: Value = serde_json::from_str(&txt)
+                        .map_err(|e| anyhow!("WS JSON parse: {}", e))?;
+                    // Match by request id
+                    if resp["id"].as_str() == Some(&req_id) {
+                        let status = resp["status"].as_u64().unwrap_or(0);
+                        if status == 200 {
+                            return Ok(resp["result"].clone());
+                        } else {
+                            let code = resp["error"]["code"].as_i64().unwrap_or(0);
+                            let msg = resp["error"]["msg"].as_str().unwrap_or("unknown");
+                            return Err(anyhow!("WS API error {}: {} (code={})", method, msg, code));
+                        }
+                    }
+                    // Not our response — skip (could be a stream message)
+                }
+                Ok(Message::Ping(d)) => {
+                    let _ = self.socket.send(Message::Pong(d));
+                }
+                Ok(_) => {} // Binary, Pong, Close — ignore
+                Err(e) => {
+                    return Err(anyhow!("WS read error: {}", e));
+                }
+            }
+        }
+    }
 }
 
 // ── Binance Helpers ──────────────────────────────────────────────────────────
-fn get_equity(client: &Client, cfg: &Config) -> Result<f64> {
-    let r = bnb_get(client, cfg, "/api/v3/account", "")?;
+fn get_equity(ws: &mut BinanceWsClient) -> Result<f64> {
+    let r = ws.request("account.status", &[])?;
     if let Some(balances) = r["balances"].as_array() {
         let mut total = 0.0_f64;
         for b in balances {
@@ -279,16 +342,16 @@ fn get_equity(client: &Client, cfg: &Config) -> Result<f64> {
 }
 
 /// Query Binance trades history to find the most recent sell fill for a symbol.
-fn get_last_sell_fill(client: &Client, cfg: &Config, inst: &str) -> Option<(f64, String)> {
-    // inst is already BTCUSDT format for Binance
+fn get_last_sell_fill(ws: &mut BinanceWsClient, inst: &str) -> Option<(f64, String)> {
     let symbol = inst.replace('-', "");
-    let r = bnb_get(client, cfg, "/api/v3/myTrades",
-        &format!("symbol={}&limit=10", symbol)).ok()?;
+    let r = ws.request("myTrades", &[
+        ("symbol", symbol),
+        ("limit", "10".to_string()),
+    ]).ok()?;
     if let Some(trades) = r.as_array() {
-        // Binance returns trades ascending; iterate in reverse for most recent
         for trade in trades.iter().rev() {
             let is_buyer = trade["isBuyer"].as_bool().unwrap_or(true);
-            if !is_buyer {  // sell trade
+            if !is_buyer {
                 let px: f64 = trade["price"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
                 if px > 0.0 {
                     let ts_ms = trade["time"].as_u64().unwrap_or(0);
@@ -303,8 +366,8 @@ fn get_last_sell_fill(client: &Client, cfg: &Config, inst: &str) -> Option<(f64,
     None
 }
 
-fn get_avail_usdt(client: &Client, cfg: &Config) -> Result<f64> {
-    let r = bnb_get(client, cfg, "/api/v3/account", "")?;
+fn get_avail_usdt(ws: &mut BinanceWsClient) -> Result<f64> {
+    let r = ws.request("account.status", &[])?;
     if let Some(balances) = r["balances"].as_array() {
         for b in balances {
             if b["asset"].as_str() == Some("USDT") {
@@ -316,8 +379,8 @@ fn get_avail_usdt(client: &Client, cfg: &Config) -> Result<f64> {
 }
 
 /// Get available balance for any coin (e.g. "SOL", "ETH") from Binance account.
-fn get_avail_coin(client: &Client, cfg: &Config, ccy: &str) -> f64 {
-    let r = match bnb_get(client, cfg, "/api/v3/account", "") {
+fn get_avail_coin(ws: &mut BinanceWsClient, ccy: &str) -> f64 {
+    let r = match ws.request("account.status", &[]) {
         Ok(v) => v,
         Err(_) => return 0.0,
     };
@@ -331,11 +394,9 @@ fn get_avail_coin(client: &Client, cfg: &Config, ccy: &str) -> f64 {
     0.0
 }
 
-fn get_price(client: &Client, symbol: &str) -> Result<f64> {
-    // Binance symbol: BTCUSDT (no dash). Our inst uses dashes for OKX; strip for Binance.
+fn get_price(ws: &mut BinanceWsClient, symbol: &str) -> Result<f64> {
     let sym = symbol.replace('-', "");
-    let r = client.get(format!("{}/api/v3/ticker/price?symbol={}", BINANCE_BASE, sym))
-        .send()?.json::<Value>()?;
+    let r = ws.request_public("ticker.price", &[("symbol", sym)])?;
     Ok(r["price"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0))
 }
 
@@ -582,10 +643,14 @@ fn daily_closed_time_count(conn: &Connection, symbol: &str, today: &str) -> u32 
     ).unwrap_or(0)
 }
 
-fn place_market_buy(client: &Client, cfg: &Config, inst: &str, usdt_amount: f64) -> Result<String> {
+fn place_market_buy(ws: &mut BinanceWsClient, inst: &str, usdt_amount: f64) -> Result<String> {
     let symbol = inst.replace('-', "");
-    let params = format!("symbol={}&side=BUY&type=MARKET&quoteOrderQty={:.2}", symbol, usdt_amount);
-    let r = bnb_post(client, cfg, "/api/v3/order", &params)?;
+    let r = ws.request("order.place", &[
+        ("symbol", symbol.clone()),
+        ("side", "BUY".to_string()),
+        ("type", "MARKET".to_string()),
+        ("quoteOrderQty", format!("{:.2}", usdt_amount)),
+    ])?;
     if let Some(oid) = r["orderId"].as_u64() {
         println!("[bnb-executor] ✅ BUY {:.2}U of {} | orderId={}", usdt_amount, symbol, oid);
         Ok(oid.to_string())
@@ -607,30 +672,34 @@ fn place_market_buy(client: &Client, cfg: &Config, inst: &str, usdt_amount: f64)
 /// Params: aboveType=LIMIT_MAKER (TP limit sell above market),
 ///         belowType=STOP_LOSS (SL market sell below market).
 /// Fallback: STOP_LOSS_LIMIT single order if OCO fails.
-fn place_oco(client: &Client, cfg: &Config, inst: &str, qty: f64, sl_px: f64, tp_px: f64) {
+fn place_oco(ws: &mut BinanceWsClient, inst: &str, qty: f64, sl_px: f64, tp_px: f64) {
     let symbol = inst.replace('-', "");
     let qty_f = (qty * 10000.0).floor() / 10000.0;
     let list_id = format!("oco{}", Utc::now().timestamp_millis());
-    // New OCO endpoint params (POST /api/v3/orderList/oco, valid since Dec 2024):
-    //   aboveType=LIMIT_MAKER  → TP: limit sell at tp_px posted to book (maker-only)
-    //   belowType=STOP_LOSS    → SL: market sell triggered when price drops to sl_px
-    let params = format!(
-        "symbol={}&listClientOrderId={}&side=SELL&quantity={:.4}\
-         &aboveType=LIMIT_MAKER&abovePrice={:.4}\
-         &belowType=STOP_LOSS&belowStopPrice={:.4}",
-        symbol, list_id, qty_f, tp_px, sl_px
-    );
-    match bnb_post(client, cfg, "/api/v3/orderList/oco", &params) {
+    match ws.request("orderList.place.oco", &[
+        ("symbol", symbol.clone()),
+        ("listClientOrderId", list_id),
+        ("side", "SELL".to_string()),
+        ("quantity", format!("{:.4}", qty_f)),
+        ("aboveType", "LIMIT_MAKER".to_string()),
+        ("abovePrice", format!("{:.4}", tp_px)),
+        ("belowType", "STOP_LOSS".to_string()),
+        ("belowStopPrice", format!("{:.4}", sl_px)),
+    ]) {
         Ok(r) if r["orderListId"].is_number() =>
             println!("[bnb-executor] 🛡️  OCO active | SL={:.4} TP={:.4} qty={:.4}", sl_px, tp_px, qty_f),
-        Ok(r) => {
+        Ok(_r) => {
             // Fallback: place stop-loss only
-            println!("[bnb-executor] ⚠️  OCO failed: {} — falling back to SL-only stop order", r["msg"].as_str().unwrap_or("unknown"));
-            let sl_params = format!(
-                "symbol={}&side=SELL&type=STOP_LOSS_LIMIT&quantity={:.4}&price={:.4}&stopPrice={:.4}&timeInForce=GTC",
-                symbol, qty_f, sl_px * 0.999, sl_px
-            );
-            match bnb_post(client, cfg, "/api/v3/order", &sl_params) {
+            println!("[bnb-executor] ⚠️  OCO failed — falling back to SL-only stop order");
+            match ws.request("order.place", &[
+                ("symbol", symbol.clone()),
+                ("side", "SELL".to_string()),
+                ("type", "STOP_LOSS_LIMIT".to_string()),
+                ("quantity", format!("{:.4}", qty_f)),
+                ("price", format!("{:.4}", sl_px * 0.999)),
+                ("stopPrice", format!("{:.4}", sl_px)),
+                ("timeInForce", "GTC".to_string()),
+            ]) {
                 Ok(r2) if r2["orderId"].is_number() => println!("[bnb-executor] 🛡️  SL fallback @ {:.4}", sl_px),
                 Ok(r2) => println!("[bnb-executor] ⚠️  SL fallback also failed: {}", r2),
                 Err(e) => println!("[bnb-executor] ⚠️  SL fallback error: {}", e),
@@ -643,14 +712,9 @@ fn place_oco(client: &Client, cfg: &Config, inst: &str, qty: f64, sl_px: f64, tp
 /// Cancel all pending conditional (algo) orders for an instrument.
 /// Must be called BEFORE any market sell (TP/trail/time/SL software) to free the
 /// coin balance that OKX locks when an algo order is active.
-fn cancel_pending_algos(client: &Client, cfg: &Config, inst: &str) {
-    // Binance: cancel all open orders for this symbol (covers OCO legs + single SL fallback).
-    // DELETE /api/v3/openOrders cancels ALL orders for the symbol, including OCO legs
-    // (canceling any leg of an OCO also cancels the entire list per Binance docs).
-    // NOTE: deprecated DELETE /api/v3/openOrderList removed; new cancel is DELETE /api/v3/orderList
-    // but that requires orderListId. Using openOrders is simpler and covers all cases.
+fn cancel_pending_algos(ws: &mut BinanceWsClient, inst: &str) {
     let symbol = inst.replace('-', "");
-    match bnb_delete(client, cfg, "/api/v3/openOrders", &format!("symbol={}", symbol)) {
+    match ws.request("openOrders.cancelAll", &[("symbol", symbol.clone())]) {
         Ok(r) => {
             if let Some(arr) = r.as_array() {
                 if !arr.is_empty() {
@@ -663,17 +727,11 @@ fn cancel_pending_algos(client: &Client, cfg: &Config, inst: &str) {
     std::thread::sleep(std::time::Duration::from_millis(300));
 }
 
-fn cancel_pending_algos_type(_client: &Client, _cfg: &Config, _inst: &str, _ord_type: &str) {
-    // Not used in Binance executor; cancel_pending_algos handles all cancellations
-}
-
-fn market_sell(client: &Client, cfg: &Config, inst: &str, qty: f64) -> bool {
+fn market_sell(ws: &mut BinanceWsClient, inst: &str, qty: f64) -> bool {
     let symbol = inst.replace('-', "");
-    // Extract coin symbol (e.g. "SOL" from "SOLUSDT") to check actual available balance.
     let ccy = if symbol.ends_with("USDT") { &symbol[..symbol.len()-4] } else { symbol.as_str() };
-    let avail = get_avail_coin(client, cfg, ccy);
+    let avail = get_avail_coin(ws, ccy);
 
-    // If avail=0, algo order may still be locking balance — signal caller to retry next cycle.
     if avail <= 0.0 {
         println!("[executor] ⏳ Sell delayed: {} avail=0 (balance locked?), retry next cycle", ccy);
         return false;
@@ -685,20 +743,23 @@ fn market_sell(client: &Client, cfg: &Config, inst: &str, qty: f64) -> bool {
     } else {
         qty
     };
-    let qty_floor = qty_floor(sell_qty);
-    if qty_floor <= 0.0 {
+    let qty_f = qty_floor(sell_qty);
+    if qty_f <= 0.0 {
         println!("[bnb-executor] ⚠️  Sell skipped: qty_floor=0 for {} (avail={:.6})", ccy, avail);
         return false;
     }
-    let body = json!({"instId":inst,"tdMode":"cash","side":"sell","ordType":"market",
-                      "sz":format!("{:.4}",qty_floor)});
-    match okx_post(client, cfg, "/api/v5/trade/order", &body) {
-        Ok(r) if r["code"].as_str() == Some("0") => {
+    match ws.request("order.place", &[
+        ("symbol", symbol.clone()),
+        ("side", "SELL".to_string()),
+        ("type", "MARKET".to_string()),
+        ("quantity", format!("{:.4}", qty_f)),
+    ]) {
+        Ok(r) if r["orderId"].is_number() => {
             println!("[executor] 💸 SELL {:.4} {} (avail was {:.4})", sell_qty, inst, avail);
             true
         },
         Ok(r) => {
-            println!("[executor] ⚠️  Sell failed: {}", r["data"][0]["sMsg"]);
+            println!("[executor] ⚠️  Sell failed: {}", r);
             false
         },
         Err(e) => {
@@ -1005,11 +1066,11 @@ fn main() -> Result<()> {
     let sim_path  = base.join("sim_history.db");
     let live_path = base.join("live_positions.db");
 
-    let client    = Client::builder().timeout(StdDuration::from_secs(10)).build()?;
+    let mut ws = BinanceWsClient::connect(&cfg.api_key, &cfg.secret_key)?;
     let live_conn = Connection::open(&live_path)?;
     init_live_db(&live_conn)?;
 
-    println!("[executor] 🦀 Live Executor v2 (Kelly+MultiPos) | BaseRisk={:.0}% | MaxPos={} | MaxPortRisk={:.0}%",
+    println!("[executor] 🦀 Live Executor v3 (WS-API+Kelly+MultiPos) | BaseRisk={:.0}% | MaxPos={} | MaxPortRisk={:.0}%",
         cfg.risk_per_trade_pct, ecfg.max_open_positions, ecfg.max_portfolio_risk_pct);
 
     loop {
@@ -1029,7 +1090,7 @@ fn main() -> Result<()> {
         // where OKX may mark a signal SKIPPED before Binance gets to evaluate it.
         let cutoff      = (Local::now() - Duration::minutes(ecfg.max_signal_age_min * 3)).format("%H:%M").to_string();
 
-        let equity = match get_equity(&client, &cfg) {
+        let equity = match get_equity(&mut ws) {
             Ok(e) => { println!("[bnb-executor] 💰 Equity={:.2}U trades={}", e, 0); e }
             Err(err) => { println!("[bnb-executor] ⚠️  get_equity failed: {} — using fallback", err); 116.0 }
         };
@@ -1126,7 +1187,7 @@ fn main() -> Result<()> {
                 // Long signals: block only if price DUMPED >3% (invalidated) or RIPPED >10% (chase).
                 // If price ran up 3-10%: dynamic entry — proceed, recalc SL/TP from fill.
                 let inst = inst_id(&sig.symbol);
-                let current = match get_price(&client, &inst) {
+                let current = match get_price(&mut ws, &inst) {
                     Ok(p) if p > 0.0 => p,
                     _ => { eprintln!("[executor] ⚠️ No price for {}", inst); continue; }
                 };
@@ -1269,7 +1330,7 @@ fn main() -> Result<()> {
 
                 // ── Kelly-sized position ──────────────────────────────────────
                 let risk_frac   = kelly_risk_fraction(&sig, base_risk, &ecfg);
-                let avail_usdt  = get_avail_usdt(&client, &cfg).unwrap_or(0.0);
+                let avail_usdt  = get_avail_usdt(&mut ws).unwrap_or(0.0);
 
                 // Coin allocation cap
                 let max_spend   = equity * coin_max_alloc(&ecfg, &sig.symbol);
@@ -1292,9 +1353,9 @@ fn main() -> Result<()> {
                     ev.unwrap_or(0.0), risk_frac*100.0, usdt_spend, sig.stop, sig.tp1);
 
                 // ── Execute ───────────────────────────────────────────────────
-                match place_market_buy(&client, &cfg, &inst, usdt_spend) {
+                match place_market_buy(&mut ws, &inst, usdt_spend) {
                     Ok(order_id) => {
-                        let fill = get_price(&client, &inst).unwrap_or(current);
+                        let fill = get_price(&mut ws, &inst).unwrap_or(current);
                         let qty  = usdt_spend / fill;
 
                         // Step 1: Recalc SL/TP from fill if: dynamic entry OR SL invalid
@@ -1319,7 +1380,7 @@ fn main() -> Result<()> {
                         if actual_stop >= fill {
                             // ABORT: SL invalid even after recalculation — undo the buy immediately
                             println!("[executor] ⛔ ABORT: SL {:.4} >= fill {:.4} — selling back", actual_stop, fill);
-                            let sold = market_sell(&client, &cfg, &inst, qty);
+                            let sold = market_sell(&mut ws, &inst, qty);
                             let abort_note = if sold { "SL>=fill after recalc, position unwound" } else { "SL>=fill after recalc, SELL FAILED — manual action required" };
                             mark_processed(&live_conn, sig_id, &sig.symbol, &sig.direction,
                                 sig.entry, actual_stop, actual_tp1, &order_id, "ABORTED", fill,
@@ -1331,7 +1392,7 @@ fn main() -> Result<()> {
                             // Using computed qty = usdt/fill over-estimates by ~0.1% (fee).
                             // Always use actual available balance as source of truth.
                             let ccy = inst.split('-').next().unwrap_or(&inst);
-                            let avail_after = get_avail_coin(&client, &cfg, ccy);
+                            let avail_after = get_avail_coin(&mut ws, ccy);
                             let actual_qty = if avail_after > 0.0 && avail_after < qty {
                                 println!("[executor] ℹ️  Actual received qty {:.6} {} (computed {:.6}, fee adj {:.4}%)",
                                     avail_after, ccy, qty, (1.0 - avail_after/qty)*100.0);
@@ -1347,7 +1408,7 @@ fn main() -> Result<()> {
                             // OCO algo order: SL + TP in one order — no balance lock conflict.
                             // OKX manages both legs; when one triggers the other auto-cancels.
                             // Software monitoring (RSI exit, trail, time) cancels this OCO before selling.
-                            place_oco(&client, &cfg, &inst, actual_qty, actual_stop, actual_tp1);
+                            place_oco(&mut ws, &inst, actual_qty, actual_stop, actual_tp1);
                             open_position(&live_conn, sig_id, &order_id, &sig.symbol,
                                           &sig.direction, actual_qty, fill, actual_stop, actual_tp1, risk_usdt,
                                           actual_tp2, p_up_val, ams_tier_char, entry_rsi);
@@ -1389,7 +1450,7 @@ fn main() -> Result<()> {
 
         for (pid, sig_id, symbol, direction, qty, entry, stop, tp1, _risk, opened_at_str, tp2, half_exited, mut high_water, pos_tier, pos_entry_rsi) in open_pos {
             let inst    = inst_id(&symbol);
-            let current = match get_price(&client, &inst) { Ok(p) => p, Err(_) => continue };
+            let current = match get_price(&mut ws, &inst) { Ok(p) => p, Err(_) => continue };
             let opened_dt = DateTime::parse_from_rfc3339(&opened_at_str)
                 .map(|d| d.with_timezone(&Local)).unwrap_or_else(|_| Local::now());
             let hold_min = (Local::now() - opened_dt).num_minutes();
@@ -1400,23 +1461,21 @@ fn main() -> Result<()> {
             // Auto-close immediately instead of retrying indefinitely.
             //
             // Key distinction:
-            // - Legitimate position with active SL algo: OKX locks coin → avail ≈ dust
-            // - True ghost (externally sold): no algo active, coin gone → avail ≈ dust
-            // Fix: only trigger ghost if avail is dust AND no pending algo orders exist.
-            // Pending algo = OKX is still managing the position → NOT a ghost.
+            // - Legitimate position with active OCO/SL: Binance locks coin → avail ≈ dust
+            // - True ghost (externally sold): no orders active, coin gone → avail ≈ dust
+            // Fix: only trigger ghost if avail is dust AND no pending orders exist.
             {
                 let ccy = symbol.replace("USDT", "");
-                let avail = get_avail_coin(&client, &cfg, &ccy);
-                let algo_url = format!("/api/v5/trade/orders-algo-pending?instId={}&ordType=conditional", inst);
-                let has_algo = okx_get(&client, &cfg, &algo_url)
+                let avail = get_avail_coin(&mut ws, &ccy);
+                let has_algo = ws.request("openOrders.status", &[("symbol", inst.clone())])
                     .ok()
-                    .and_then(|v| v["data"].as_array().map(|a| !a.is_empty()))
+                    .and_then(|v| v.as_array().map(|a| !a.is_empty()))
                     .unwrap_or(false);
                 if qty_floor(avail) == 0.0 && avail < 0.001 && !has_algo {
-                    // Try to get actual exit price from OKX fills history
-                    // (covers: algo SL executed by OKX, manual close, liquidation)
-                    let (exit_price, fill_note) = match get_last_sell_fill(&client, &cfg, &inst) {
-                        Some((fp, _)) if fp > 0.0 => (fp, format!("okx_fill@{:.4}", fp)),
+                    // Try to get actual exit price from Binance fills history
+                    // (covers: OCO SL executed by Binance, manual close)
+                    let (exit_price, fill_note) = match get_last_sell_fill(&mut ws, &inst) {
+                        Some((fp, _)) if fp > 0.0 => (fp, format!("bnb_fill@{:.4}", fp)),
                         _ => (current, format!("est@{:.4}", current)),
                     };
                     let ghost_pnl = (exit_price - entry) * qty;
@@ -1461,8 +1520,8 @@ fn main() -> Result<()> {
                 println!("[executor] 🎯 TP1 PARTIAL {} — selling 50% ({:.4}) +{:.4}U, moving SL→breakeven, holding for TP2={:.4}",
                     symbol, half_qty, half_pnl, tp2);
                 // Cancel SL algo FIRST so OKX releases the coin balance lock
-                cancel_pending_algos(&client, &cfg, &inst);
-                let sold = market_sell(&client, &cfg, &inst, half_qty);
+                cancel_pending_algos(&mut ws, &inst);
+                let sold = market_sell(&mut ws, &inst, half_qty);
                 if sold {
                     let remaining_qty = qty_floor(qty - half_qty);
                     // Update: mark half_exited, move SL to entry (breakeven), reduce qty
@@ -1474,7 +1533,7 @@ fn main() -> Result<()> {
                         params![half_pnl, today_utc]).ok();
                     println!("[executor] ✅ Half sold. Remaining {:.4} {}, SL moved to breakeven {:.4}", remaining_qty, symbol, entry);
                     // Re-place OCO: SL at breakeven + TP at TP2 for remaining position
-                    place_oco(&client, &cfg, &inst, remaining_qty, entry, tp2);
+                    place_oco(&mut ws, &inst, remaining_qty, entry, tp2);
                 } else {
                     println!("[executor] ⚠️  Partial sell failed — retrying next cycle");
                 }
@@ -1484,11 +1543,11 @@ fn main() -> Result<()> {
             // ── Second half: TP2 hit ─────────────────────────────────────────
             let (closed, pnl, status, reason) = if half_exited == 1 && tp2 > 0.0 && direction == "Long" && current >= tp2 {
                 // Cancel SL algo first to free balance lock
-                cancel_pending_algos(&client, &cfg, &inst);
+                cancel_pending_algos(&mut ws, &inst);
                 // PnL uses current (market fill), not fixed TP2 price
                 let p = (current - entry) * qty;
                 println!("[executor] 🚀 TP2! {} full exit +{:.4}U @ {:.4} (TP2={:.4})", symbol, p, current, tp2);
-                let sold = market_sell(&client, &cfg, &inst, qty);
+                let sold = market_sell(&mut ws, &inst, qty);
                 if sold { (true, p, "CLOSED_TP2", format!("{:.4}≥TP2{:.4}", current, tp2)) }
                 else { println!("[executor] ⚠️  TP2 sell failed — retrying"); (false, 0.0, "", String::new()) }
 
@@ -1514,11 +1573,11 @@ fn main() -> Result<()> {
             {
                 let rsi_now = get_rsi_from_cache(&symbol, &base);
                 if rsi_now > 52.0 {
-                    cancel_pending_algos(&client, &cfg, &inst);
+                    cancel_pending_algos(&mut ws, &inst);
                     let p = (current - entry) * qty;
                     println!("[executor] 📈 RSI exit {} — reversion complete RSI={:.1} @ {:.4} +{:.4}U",
                         symbol, rsi_now, current, p);
-                    let sold = market_sell(&client, &cfg, &inst, qty);
+                    let sold = market_sell(&mut ws, &inst, qty);
                     if sold { (true, p, "CLOSED_RSI_EXIT", format!("RSI={:.1}>52, curr={:.4}", rsi_now, current)) }
                     else { println!("[executor] ⚠️  RSI exit sell failed — retrying"); (false, 0.0, "", String::new()) }
                 } else {
@@ -1527,11 +1586,11 @@ fn main() -> Result<()> {
 
             // ── Trailing stop hit (after TP1, trail_sl above entry) ──────────
             } else if trail_sl > 0.0 && direction == "Long" && current <= trail_sl {
-                cancel_pending_algos(&client, &cfg, &inst);
+                cancel_pending_algos(&mut ws, &inst);
                 let p = (current - entry) * qty;
                 println!("[executor] 🔄 Trail stop {} — high={:.4} trail_sl={:.4} curr={:.4} +{:.4}U",
                     symbol, high_water, trail_sl, current, p);
-                let sold = market_sell(&client, &cfg, &inst, qty);
+                let sold = market_sell(&mut ws, &inst, qty);
                 if sold { (true, p, "CLOSED_TRAIL", format!("{:.4}≤trail_sl{:.4}", current, trail_sl)) }
                 else { println!("[executor] ⚠️  Trail sell failed — retrying"); (false, 0.0, "", String::new()) }
 
@@ -1543,21 +1602,21 @@ fn main() -> Result<()> {
                 // Tier F override: always 45 min (1H signal, expires fast)
                 if pos_tier == "F" { 45 } else { timed_hold }
             } {
-                cancel_pending_algos(&client, &cfg, &inst);
+                cancel_pending_algos(&mut ws, &inst);
                 let p = (current - entry) * qty;
                 println!("[executor] ⏱️  Time exit {} {}min @ {:.4}", symbol, hold_min, current);
-                let sold = market_sell(&client, &cfg, &inst, qty);
+                let sold = market_sell(&mut ws, &inst, qty);
                 if sold { (true, p, "CLOSED_TIME", format!("{}min, exit@{:.4}", hold_min, current)) }
                 else { println!("[executor] ⚠️  Sell failed — retrying next cycle"); (false, 0.0, "", String::new()) }
 
             // ── SL hit (original or breakeven after partial) ─────────────────
             } else if direction == "Long" && current <= stop {
-                cancel_pending_algos(&client, &cfg, &inst);
+                cancel_pending_algos(&mut ws, &inst);
                 let p = (current - entry) * qty;
                 let label = if half_exited == 1 { "CLOSED_BREAKEVEN" } else { "CLOSED_SL" };
                 let emoji = if half_exited == 1 { "⚖️" } else { "🛑" };
                 println!("[executor] {} SL {} {:.4}U @ {:.4} ({})", emoji, symbol, p, current, label);
-                let sold = market_sell(&client, &cfg, &inst, qty);
+                let sold = market_sell(&mut ws, &inst, qty);
                 if sold { (true, p, label, format!("{:.4}≤SL{:.4}", current, stop)) }
                 else { println!("[executor] ⚠️  Sell failed — retrying next cycle"); (false, 0.0, "", String::new()) }
 
@@ -1583,6 +1642,14 @@ fn main() -> Result<()> {
                      WHERE trade_date=?3",
                     params![pnl,is_loss,today_utc]).ok();
                 journal_closed(&base, &fake, pnl, status, &reason);
+            }
+        }
+
+        // Reconnect WS if broken (e.g. server-side disconnect after 24h)
+        if let Err(e) = ws.request_public("ping", &[]) {
+            eprintln!("[bnb-executor] ⚠️  WS health check failed: {} — reconnecting", e);
+            if let Err(re) = ws.reconnect() {
+                eprintln!("[bnb-executor] ❌ Reconnect failed: {} — retrying next cycle", re);
             }
         }
 
@@ -3016,5 +3083,67 @@ mod tests {
         }
         assert_eq!(daily_closed_time_count(&conn, "DOTUSDT", &today), 2,
             "2 CLOSED_TIME exits today → count must be 2 (re-entry blocked)");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // WS API: SIGN FUNCTION + PARAM BUILDER
+    // ════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn ws_sign_known_vector() {
+        // Known HMAC-SHA256 test vector
+        let secret = "NhqPtmdSJYdKjVHjA7PZj4Mge3R5YNiP1e3UZjInClVN65XAbvqqM6A7H5fATj0j";
+        let query = "apiKey=vmPUZE6mv9SD5VNHk4HlWFsOr6aKE2zvsw0MuIgwCIPy6utIco14y7Ju91duEh8A&recvWindow=10000&symbol=BTCUSDT&timestamp=1234567890000";
+        let sig = bnb_sign(secret, query);
+        // Verify it's a valid 64-char hex string
+        assert_eq!(sig.len(), 64, "HMAC-SHA256 hex must be 64 chars");
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()), "Must be hex");
+    }
+
+    #[test]
+    fn ws_sign_empty_query() {
+        let sig = bnb_sign("secret", "");
+        assert_eq!(sig.len(), 64);
+    }
+
+    #[test]
+    fn ws_build_sorted_query_alphabetical() {
+        let params = vec![
+            ("timestamp".to_string(), "123".to_string()),
+            ("apiKey".to_string(), "abc".to_string()),
+            ("symbol".to_string(), "BTCUSDT".to_string()),
+            ("recvWindow".to_string(), "10000".to_string()),
+        ];
+        let q = build_sorted_query(&params);
+        assert_eq!(q, "apiKey=abc&recvWindow=10000&symbol=BTCUSDT&timestamp=123");
+    }
+
+    #[test]
+    fn ws_build_sorted_query_single_param() {
+        let params = vec![("symbol".to_string(), "ETHUSDT".to_string())];
+        let q = build_sorted_query(&params);
+        assert_eq!(q, "symbol=ETHUSDT");
+    }
+
+    #[test]
+    fn ws_build_sorted_query_empty() {
+        let params: Vec<(String, String)> = vec![];
+        let q = build_sorted_query(&params);
+        assert_eq!(q, "");
+    }
+
+    #[test]
+    fn ws_sign_deterministic() {
+        // Same input must always produce same output
+        let s1 = bnb_sign("key", "data");
+        let s2 = bnb_sign("key", "data");
+        assert_eq!(s1, s2, "HMAC-SHA256 must be deterministic");
+    }
+
+    #[test]
+    fn ws_sign_different_keys_different_output() {
+        let s1 = bnb_sign("key1", "data");
+        let s2 = bnb_sign("key2", "data");
+        assert_ne!(s1, s2, "Different keys must produce different signatures");
     }
 }
