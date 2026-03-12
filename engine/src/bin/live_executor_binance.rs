@@ -603,13 +603,22 @@ fn place_market_buy(client: &Client, cfg: &Config, inst: &str, usdt_amount: f64)
 /// - stopPrice: SL trigger price
 /// - stopLimitPrice: SL limit price (set same as stopPrice for near-market fill)
 /// - stopLimitTimeInForce: GTC
+/// Place OCO order using the NEW /api/v3/orderList/oco endpoint (Dec 2024+).
+/// Params: aboveType=LIMIT_MAKER (TP limit sell above market),
+///         belowType=STOP_LOSS (SL market sell below market).
+/// Fallback: STOP_LOSS_LIMIT single order if OCO fails.
 fn place_oco(client: &Client, cfg: &Config, inst: &str, qty: f64, sl_px: f64, tp_px: f64) {
     let symbol = inst.replace('-', "");
     let qty_f = (qty * 10000.0).floor() / 10000.0;
     let list_id = format!("oco{}", Utc::now().timestamp_millis());
+    // New OCO endpoint params (POST /api/v3/orderList/oco, valid since Dec 2024):
+    //   aboveType=LIMIT_MAKER  → TP: limit sell at tp_px posted to book (maker-only)
+    //   belowType=STOP_LOSS    → SL: market sell triggered when price drops to sl_px
     let params = format!(
-        "symbol={}&listClientOrderId={}&side=SELL&quantity={:.4}&price={:.4}&stopPrice={:.4}&stopLimitPrice={:.4}&stopLimitTimeInForce=GTC",
-        symbol, list_id, qty_f, tp_px, sl_px, sl_px
+        "symbol={}&listClientOrderId={}&side=SELL&quantity={:.4}\
+         &aboveType=LIMIT_MAKER&abovePrice={:.4}\
+         &belowType=STOP_LOSS&belowStopPrice={:.4}",
+        symbol, list_id, qty_f, tp_px, sl_px
     );
     match bnb_post(client, cfg, "/api/v3/orderList/oco", &params) {
         Ok(r) if r["orderListId"].is_number() =>
@@ -635,14 +644,12 @@ fn place_oco(client: &Client, cfg: &Config, inst: &str, qty: f64, sl_px: f64, tp
 /// Must be called BEFORE any market sell (TP/trail/time/SL software) to free the
 /// coin balance that OKX locks when an algo order is active.
 fn cancel_pending_algos(client: &Client, cfg: &Config, inst: &str) {
-    // Binance: cancel all open OCO lists and open orders for this symbol
+    // Binance: cancel all open orders for this symbol (covers OCO legs + single SL fallback).
+    // DELETE /api/v3/openOrders cancels ALL orders for the symbol, including OCO legs
+    // (canceling any leg of an OCO also cancels the entire list per Binance docs).
+    // NOTE: deprecated DELETE /api/v3/openOrderList removed; new cancel is DELETE /api/v3/orderList
+    // but that requires orderListId. Using openOrders is simpler and covers all cases.
     let symbol = inst.replace('-', "");
-    // Cancel all open OCO lists
-    match bnb_delete(client, cfg, "/api/v3/openOrderList", &format!("symbol={}", symbol)) {
-        Ok(_) => println!("[bnb-executor] 🗑️  OCO orders cancelled for {}", symbol),
-        Err(_) => {} // May not exist, that's fine
-    }
-    // Cancel all remaining open orders (stop-loss fallback)
     match bnb_delete(client, cfg, "/api/v3/openOrders", &format!("symbol={}", symbol)) {
         Ok(r) => {
             if let Some(arr) = r.as_array() {
