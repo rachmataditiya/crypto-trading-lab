@@ -841,13 +841,17 @@ fn journal_skipped(base: &Path, sym: &str, dir: &str, reason: &str) {
 fn init_live_db(conn: &Connection) -> Result<()> {
     conn.execute_batch("
         CREATE TABLE IF NOT EXISTS processed_signals (
-            signal_id    INTEGER PRIMARY KEY,
+            signal_id    INTEGER NOT NULL,
+            exchange     TEXT NOT NULL DEFAULT 'okx',
             processed_at TEXT NOT NULL,
             symbol TEXT, direction TEXT,
             entry REAL, stop REAL, tp1 REAL,
             order_id TEXT, status TEXT, fill_price REAL,
-            pnl_usdt REAL, notes TEXT
+            pnl_usdt REAL, notes TEXT,
+            PRIMARY KEY (signal_id, exchange)
         );
+        -- Migrate: add exchange column if table already exists without it
+        ALTER TABLE processed_signals ADD COLUMN exchange TEXT NOT NULL DEFAULT 'okx';
         CREATE TABLE IF NOT EXISTS open_positions (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             signal_id   INTEGER, order_id TEXT,
@@ -880,7 +884,7 @@ fn init_live_db(conn: &Connection) -> Result<()> {
 }
 
 fn is_processed(conn: &Connection, sig_id: i64) -> bool {
-    conn.query_row("SELECT 1 FROM processed_signals WHERE signal_id=?",
+    conn.query_row("SELECT 1 FROM processed_signals WHERE signal_id=? AND exchange='binance'",
         params![sig_id], |_| Ok(true)).unwrap_or(false)
 }
 
@@ -890,8 +894,8 @@ fn mark_processed(conn: &Connection, sig_id: i64, symbol: &str, direction: &str,
     let now = Utc::now().to_rfc3339();
     let _ = conn.execute(
         "INSERT OR IGNORE INTO processed_signals
-         (signal_id,processed_at,symbol,direction,entry,stop,tp1,order_id,status,fill_price,notes)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+         (signal_id,exchange,processed_at,symbol,direction,entry,stop,tp1,order_id,status,fill_price,notes)
+         VALUES(?1,'binance',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         params![sig_id,now,symbol,direction,entry,stop,tp1,order_id,status,fill,notes]);
 }
 
@@ -1417,7 +1421,7 @@ fn main() -> Result<()> {
                         "UPDATE open_positions SET status='CLOSED_GHOST', closed_at=? WHERE id=?",
                         params![closed_now, pid]).ok();
                     live_conn.execute(
-                        "UPDATE processed_signals SET status='CLOSED_GHOST', pnl_usdt=? WHERE signal_id=?",
+                        "UPDATE processed_signals SET status='CLOSED_GHOST', pnl_usdt=? WHERE signal_id=? AND exchange='binance'",
                         params![ghost_pnl, sig_id]).ok();
                     let is_loss: i64 = if ghost_pnl < 0.0 { 1 } else { 0 };
                     live_conn.execute(
@@ -1561,7 +1565,7 @@ fn main() -> Result<()> {
                     eprintln!("[executor] ❌ DB update failed (open_positions id={}): {}", pid, e);
                 }
                 if let Err(e) = live_conn.execute(
-                    "UPDATE processed_signals SET status=?,pnl_usdt=? WHERE signal_id=?",
+                    "UPDATE processed_signals SET status=?,pnl_usdt=? WHERE signal_id=? AND exchange='binance'",
                     params![status, pnl, sig_id]) {
                     eprintln!("[executor] ❌ DB update failed (processed_signals id={}): {}", sig_id, e);
                 }
