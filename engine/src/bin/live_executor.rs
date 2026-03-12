@@ -812,8 +812,7 @@ fn init_live_db(conn: &Connection) -> Result<()> {
             symbol TEXT, direction TEXT,
             entry REAL, stop REAL, tp1 REAL,
             order_id TEXT, status TEXT, fill_price REAL,
-            pnl_usdt REAL, notes TEXT,
-            PRIMARY KEY (signal_id, exchange)
+            pnl_usdt REAL, notes TEXT
         );
         CREATE TABLE IF NOT EXISTS open_positions (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -843,8 +842,8 @@ fn init_live_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN entry_rsi REAL DEFAULT 50.0", params![]);
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN closed_at TEXT", params![]);
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN ams_tier TEXT DEFAULT 'X'", params![]);
-    // Idempotent migration: add exchange column to processed_signals if created before composite PK
-    let _ = conn.execute("ALTER TABLE processed_signals ADD COLUMN exchange TEXT NOT NULL DEFAULT 'okx'", params![]);
+    // Idempotent migration: add exchange column to processed_signals (ignore if already exists)
+    conn.execute("ALTER TABLE processed_signals ADD COLUMN exchange TEXT DEFAULT 'okx'", params![]).ok();
     Ok(())
 }
 

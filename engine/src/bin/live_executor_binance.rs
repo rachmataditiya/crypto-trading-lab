@@ -847,11 +847,9 @@ fn init_live_db(conn: &Connection) -> Result<()> {
             symbol TEXT, direction TEXT,
             entry REAL, stop REAL, tp1 REAL,
             order_id TEXT, status TEXT, fill_price REAL,
-            pnl_usdt REAL, notes TEXT,
-            PRIMARY KEY (signal_id, exchange)
+            pnl_usdt REAL, notes TEXT
         );
-        -- Migrate: add exchange column if table already exists without it
-        ALTER TABLE processed_signals ADD COLUMN exchange TEXT NOT NULL DEFAULT 'okx';
+
         CREATE TABLE IF NOT EXISTS open_positions (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             signal_id   INTEGER, order_id TEXT,
