@@ -1018,7 +1018,9 @@ fn main() -> Result<()> {
         //    Root cause of SOL grade A being ignored 2026-03-11 01:25–01:50 WIB.
         let today_utc   = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let today_local = Local::now().format("%Y-%m-%d").to_string();
-        let cutoff      = (Local::now() - Duration::minutes(ecfg.max_signal_age_min)).format("%H:%M").to_string();
+        // Binance uses 2x signal window vs OKX — compensates for async cycle timing
+        // where OKX may mark a signal SKIPPED before Binance gets to evaluate it.
+        let cutoff      = (Local::now() - Duration::minutes(ecfg.max_signal_age_min * 3)).format("%H:%M").to_string();
 
         let equity = match get_equity(&client, &cfg) {
             Ok(e) => { println!("[bnb-executor] 💰 Equity={:.2}U trades={}", e, 0); e }
