@@ -42,12 +42,12 @@ const BINANCE_SYMBOLS: &[&str] = &[
     // DeFi
     "UNIUSDT", "AAVEUSDT", "LINKUSDT", "MKRUSDT",
     // Layer 2 / Ecosystem
-    "MATICUSDT", "ARBUSDT", "OPUSDT", "APTUSDT", "SUIUSDT",
+    "POLUSDT", "ARBUSDT", "OPUSDT", "APTUSDT", "SUIUSDT",
     // Meme / High beta
     "DOGEUSDT", "WIFUSDT",
     // Other high-liquidity
     "LTCUSDT", "FILUSDT", "INJUSDT", "TIAUSDT",
-    "FETUSDT", "RENDERUSDT", "THETAUSDT", "RUNEUSDT",
+    "FETUSDT", "RENDERUSDT", "SEIUSDT", "PENDLEUSDT",
 ];
 
 /// Binance kline timeframes we subscribe to.
