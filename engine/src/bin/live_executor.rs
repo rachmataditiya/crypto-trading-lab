@@ -815,8 +815,6 @@ fn init_live_db(conn: &Connection) -> Result<()> {
             pnl_usdt REAL, notes TEXT,
             PRIMARY KEY (signal_id, exchange)
         );
-        -- Migrate: add exchange column if table already exists without it
-        ALTER TABLE processed_signals ADD COLUMN exchange TEXT NOT NULL DEFAULT 'okx';
         CREATE TABLE IF NOT EXISTS open_positions (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             signal_id   INTEGER, order_id TEXT,
@@ -845,6 +843,8 @@ fn init_live_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN entry_rsi REAL DEFAULT 50.0", params![]);
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN closed_at TEXT", params![]);
     let _ = conn.execute("ALTER TABLE open_positions ADD COLUMN ams_tier TEXT DEFAULT 'X'", params![]);
+    // Idempotent migration: add exchange column to processed_signals if created before composite PK
+    let _ = conn.execute("ALTER TABLE processed_signals ADD COLUMN exchange TEXT NOT NULL DEFAULT 'okx'", params![]);
     Ok(())
 }
 
